@@ -1,0 +1,10 @@
+
+__pycache__/
+*_profile/
+*.bak
+*.bak.*
+*.env
+*.json
+*.key
+*.log
+config.ini
