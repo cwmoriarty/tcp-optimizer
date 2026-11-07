@@ -30,8 +30,13 @@ that's almost always worth checking before touching TCP buffers.
   `Low-Latency / Gaming`, and a reset to macOS's own defaults).
 - **Advanced** — edit each parameter individually, with a documented safe
   range for each.
-- **Diagnostics** — Wi-Fi link info, `networkQuality`, `ifconfig`/MTU, DNS
-  lookup timing.
+- **Diagnostics** — Runs Wi-Fi link info (`airport` / `system_profiler`),
+  `networkQuality`, `ifconfig`/MTU, and DNS lookup timing (`dig` / `nslookup`).
+  Each check automatically parses raw CLI output into a high-level report
+  flagging misconfigurations, hardware bottlenecks (e.g. 2.4 GHz band,
+  100baseTX Ethernet negotiation caps, bufferbloat, DHCP failure), and
+  actionable recommendations before displaying the raw tool output. Includes
+  "Run All Checks" and "Clear" controls.
 - **Persistence** — `sysctl -w` changes reset on every reboot. This tab can
   install a small root-owned LaunchDaemon (`com.punksm4ck.tcpoptimizer`)
   that re-applies your chosen preset at boot, and an uninstall button to
