@@ -7,7 +7,7 @@ parameters (sysctl net.inet.tcp.*) that can affect throughput and
 latency on high-bandwidth connections.
 
 Honest caveat baked into the app itself (see the Overview tab):
-modern macOS already auto-tunes TCP send/receive buffers, so manual
+modern macOS already auto-tunes TCP send/receive windows, so manual
 tuning usually yields small, situational gains. The bigger wins on a
 MacBook Air are almost always Wi‑Fi band/channel, DNS, or an upstream
 bottleneck — the Diagnostics tab exists to help you tell the
@@ -20,20 +20,31 @@ party dependencies.
 Run with:  python3 tcp_optimizer.py
 """
 
-import ipaddress
-import json
 import os
 import platform
-import re
+import queue
 import shlex
 import subprocess
-import sys
+import threading
+import time
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import messagebox, scrolledtext, ttk
+
+from diagnostics import (
+    extract_default_gateway,
+    parse_dns_output,
+    parse_ifconfig_output,
+    parse_networkquality_output,
+    parse_ping_output,
+    parse_tcp_stats_output,
+    parse_wifi_output,
+)
 
 APP_NAME = "TCP Optimizer"
-LAUNCH_DAEMON_LABEL = "com.punksm4ck.tcpoptimizer"
+LAUNCH_DAEMON_LABEL = "com.cwmoriarty.tcpoptimizer"
+LEGACY_LAUNCH_DAEMON_LABEL = "com.punksm4ck.tcpoptimizer"
 LAUNCH_DAEMON_PATH = f"/Library/LaunchDaemons/{LAUNCH_DAEMON_LABEL}.plist"
+LEGACY_LAUNCH_DAEMON_PATH = f"/Library/LaunchDaemons/{LEGACY_LAUNCH_DAEMON_LABEL}.plist"
 SCRIPT_INSTALL_PATH = "/usr/local/sbin/tcpoptimizer-apply.sh"
 
 # ---------------------------------------------------------------------------
@@ -127,6 +138,12 @@ def run(cmd, timeout=15):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return p.returncode == 0, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        timeout_msg = f"Command timed out after {timeout}s"
+        err_msg = f"{err.strip()}\n{timeout_msg}".strip() if err.strip() else timeout_msg
+        return False, out.strip(), err_msg
     except Exception as e:
         return False, "", str(e)
 
@@ -170,816 +187,27 @@ def apply_sysctl_values(values):
 
 
 def read_sysctl(key):
-    ok, out, err = run(["sysctl", "-n", key])
+    ok, out, _ = run(["sysctl", "-n", key])
     if ok:
         return out
     return None
 
 
-# ---------------------------------------------------------------------------
-# Diagnostic Parsers & Bottleneck Detection
-# ---------------------------------------------------------------------------
-class DiagnosticReport:
-    """Structured report extracted from CLI tool diagnostic output."""
-
-    def __init__(
-        self,
-        title,
-        status="INFO",
-        summary="",
-        findings=None,
-        issues=None,
-        recommendations=None,
-        raw="",
-    ):
-        self.title = title
-        self.status = status  # "OK", "WARNING", "ERROR", "INFO"
-        self.summary = summary
-        self.findings = findings or []  # list of (key, value) pairs
-        self.issues = issues or []  # list of (severity, description) tuples
-        self.recommendations = recommendations or []  # list of strings
-        self.raw = raw
-
-    def format_text(self, cmd=""):
-        lines = []
-        lines.append("=" * 76)
-        lines.append(f"  DIAGNOSTIC REPORT: {self.title.upper()}")
-        lines.append("=" * 76)
-        lines.append(f"Status: [{self.status}] {self.summary}")
-        lines.append("")
-
-        if self.findings:
-            lines.append("Key Findings:")
-            for k, v in self.findings:
-                lines.append(f"  • {k:22s}: {v}")
-            lines.append("")
-
-        lines.append("Issues & Misconfigurations:")
-        if self.issues:
-            for severity, desc in self.issues:
-                icon = "❌" if severity == "ERROR" else ("⚠️" if severity == "WARNING" else "ℹ️")
-                lines.append(f"  {icon} [{severity}] {desc}")
-        else:
-            lines.append("  ✓ No misconfigurations or bottlenecks detected.")
-        lines.append("")
-
-        if self.recommendations:
-            lines.append("Actionable Recommendations:")
-            for rec in self.recommendations:
-                lines.append(f"  → {rec}")
-            lines.append("")
-
-        cmd_label = f" ({cmd})" if cmd else ""
-        lines.append("-" * 76)
-        lines.append(f"RAW CLI OUTPUT{cmd_label}")
-        lines.append("-" * 76)
-        lines.append(self.raw.strip() if self.raw.strip() else "(no output)")
-        lines.append("=" * 76)
-        lines.append("\n")
-        return "\n".join(lines)
-
-
-def parse_wifi_output(ok, out, err, cmd=""):
-    """Parse Wi-Fi CLI output (airport -I or system_profiler SPAirPortDataType)."""
-    raw = out if ok else (err or out)
-    if not ok:
-        return DiagnosticReport(
-            title="Wi-Fi Link Info",
-            status="ERROR",
-            summary="Failed to query Wi-Fi status.",
-            issues=[("ERROR", f"Command failed: {err or out}")],
-            recommendations=["Verify Wi-Fi hardware is enabled in macOS System Settings."],
-            raw=raw,
-        )
-
-    findings = []
-    issues = []
-    recommendations = []
-
-    is_airport = "agrCtlRSSI" in out or "lastTxRate" in out
-
-    ssid = None
-    channel_str = None
-    channel_num = None
-    band = None
-    width = None
-    phy_mode = None
-    rssi = None
-    noise = None
-    tx_rate = None
-    mcs = None
-    security = None
-    status = None
-
-    if is_airport:
-        for line in out.splitlines():
-            line = line.strip()
-            if line.startswith("SSID:"):
-                ssid = line.split(":", 1)[1].strip()
-            elif line.startswith("agrCtlRSSI:"):
-                try:
-                    rssi = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
-            elif line.startswith("agrCtlNoise:"):
-                try:
-                    noise = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
-            elif line.startswith("lastTxRate:"):
-                try:
-                    tx_rate = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
-            elif line.startswith("MCS:"):
-                try:
-                    mcs = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
-            elif line.startswith("link auth:"):
-                security = line.split(":", 1)[1].strip()
-            elif line.startswith("channel:"):
-                channel_str = line.split(":", 1)[1].strip()
-                m_ch = re.match(r'(\d+)(?:,(\d+))?', channel_str)
-                if m_ch:
-                    channel_num = int(m_ch.group(1))
-                    width = f"{m_ch.group(2)}MHz" if m_ch.group(2) else None
-            elif line.startswith("state:"):
-                status = "Connected" if line.split(":", 1)[1].strip() == "running" else "Disconnected"
-    else:
-        m_status = re.search(r'Status:\s*([^\n\r]+)', out)
-        if m_status:
-            status = m_status.group(1).strip()
-
-        curr_net_match = re.search(r'Current Network Information:\s*\n\s*([^:\n\r]+):', out)
-        if curr_net_match:
-            ssid = curr_net_match.group(1).strip()
-            status = "Connected"
-
-        m_phy = re.search(r'PHY Mode:\s*([^\n\r]+)', out)
-        if m_phy:
-            phy_mode = m_phy.group(1).strip()
-
-        m_chan = re.search(r'Channel:\s*([^\n\r]+)', out)
-        if m_chan:
-            channel_str = m_chan.group(1).strip()
-            m_num = re.search(r'(\d+)', channel_str)
-            if m_num:
-                channel_num = int(m_num.group(1))
-            if "2GHz" in channel_str or "2.4GHz" in channel_str:
-                band = "2.4 GHz"
-            elif "5GHz" in channel_str:
-                band = "5 GHz"
-            elif "6GHz" in channel_str:
-                band = "6 GHz"
-            m_w = re.search(r'(\d+MHz)', channel_str)
-            if m_w:
-                width = m_w.group(1)
-
-        m_sec = re.search(r'Security:\s*([^\n\r]+)', out)
-        if m_sec:
-            security = m_sec.group(1).strip()
-
-        m_sig = re.search(r'Signal\s*/\s*Noise:\s*(-?\d+)\s*dBm\s*/\s*(-?\d+)\s*dBm', out)
-        if m_sig:
-            rssi = int(m_sig.group(1))
-            noise = int(m_sig.group(2))
-
-        m_tx = re.search(r'Transmit Rate:\s*(\d+)', out)
-        if m_tx:
-            tx_rate = int(m_tx.group(1))
-
-        m_mcs = re.search(r'MCS Index:\s*(\d+)', out)
-        if m_mcs:
-            mcs = int(m_mcs.group(1))
-
-    # Deduce band from channel number if not explicitly found in string
-    if band is None and channel_num is not None:
-        if 1 <= channel_num <= 14:
-            band = "2.4 GHz"
-        elif 32 <= channel_num <= 177:
-            band = "5 GHz"
-        elif channel_num > 177:
-            band = "6 GHz"
-
-    # Evaluate Connection State
-    if status != "Connected" and not ssid:
-        return DiagnosticReport(
-            title="Wi-Fi Link Info",
-            status="WARNING" if "Off" in str(status) else "INFO",
-            summary=f"Wi-Fi is {status or 'Not Connected'}.",
-            findings=[("Wi-Fi Status", status or "Disconnected")],
-            issues=[("WARNING", "Wi-Fi is not connected to any network.")],
-            recommendations=[
-                "If using a wired Ethernet connection, this is expected.",
-                "If Wi-Fi is intended, connect to an available network in macOS Settings.",
-            ],
-            raw=raw,
-        )
-
-    # Findings
-    findings.append(("Network Name (SSID)", ssid or "Unknown"))
-    if band:
-        chan_disp = f"{channel_num} ({band}{f', {width}' if width else ''})" if channel_num else band
-        findings.append(("Channel & Band", chan_disp))
-    elif channel_str:
-        findings.append(("Channel", channel_str))
-
-    if phy_mode:
-        findings.append(("Wi-Fi Standard", phy_mode))
-
-    if tx_rate is not None:
-        eff_tp = int(tx_rate * 0.68)
-        findings.append(("Transmit Rate", f"{tx_rate} Mbps (Est. TCP throughput: ~{eff_tp} Mbps)"))
-
-    if rssi is not None and noise is not None:
-        snr = rssi - noise
-        sig_quality = (
-            "Excellent" if rssi >= -60 else ("Good" if rssi >= -70 else ("Fair" if rssi >= -80 else "Poor"))
-        )
-        findings.append(("Signal Strength", f"{rssi} dBm ({sig_quality}) / Noise: {noise} dBm (SNR: {snr} dB)"))
-    elif rssi is not None:
-        findings.append(("Signal (RSSI)", f"{rssi} dBm"))
-
-    if mcs is not None:
-        findings.append(("MCS Index", str(mcs)))
-    if security:
-        findings.append(("Security", security))
-
-    # Bottleneck & Misconfiguration Analysis
-    report_status = "OK"
-
-    # 1. 2.4 GHz bottleneck
-    if band == "2.4 GHz" or (channel_num and channel_num <= 14):
-        report_status = "WARNING"
-        issues.append((
-            "WARNING",
-            f"Connected to 2.4 GHz band (Channel {channel_num or 1}). 2.4 GHz suffers from high interference, "
-            "narrow channel width (20 MHz), and typical real-world speeds capped at 50–100 Mbps. "
-            "TCP stack tuning cannot overcome this physical wireless bottleneck."
-        ))
-        recommendations.append(
-            "Connect to your router's 5 GHz or 6 GHz Wi-Fi SSID for gigabit-class throughput."
-        )
-
-    # 2. Legacy PHY mode
-    is_modern_wifi = any(m in (phy_mode or "").lower() for m in ["802.11ac", "802.11ax", "802.11be"])
-    is_legacy_wifi = not is_modern_wifi and bool(re.search(r'802\.11[abgn]\b', (phy_mode or "").lower()))
-    if is_legacy_wifi:
-        if report_status != "ERROR":
-            report_status = "WARNING"
-        issues.append((
-            "WARNING",
-            f"Legacy Wi-Fi standard ({phy_mode}). Modern high-speed connections require Wi-Fi 5 (802.11ac) "
-            "or Wi-Fi 6/6E (802.11ax) to achieve speeds above 150 Mbps."
-        ))
-
-    # 3. Weak signal or low SNR
-    if rssi is not None and rssi < -75:
-        report_status = "WARNING"
-        issues.append((
-            "WARNING",
-            f"Weak Wi-Fi signal ({rssi} dBm). Weak reception causes packet retransmissions, frame drops, "
-            "and triggers TCP congestion window collapses."
-        ))
-        recommendations.append(
-            "Move closer to your Wi-Fi access point or eliminate physical obstructions."
-        )
-    elif rssi is not None and noise is not None and (rssi - noise) < 18:
-        report_status = "WARNING"
-        issues.append((
-            "WARNING",
-            f"Low Signal-to-Noise Ratio (SNR: {rssi - noise} dB). RF noise/interference is degrading connection reliability."
-        ))
-
-    # 4. Low link rate
-    if tx_rate is not None and tx_rate < 150:
-        if report_status != "ERROR":
-            report_status = "WARNING"
-        issues.append((
-            "WARNING",
-            f"Physical link transmit rate is only {tx_rate} Mbps. Your TCP throughput cannot exceed ~{int(tx_rate * 0.68)} Mbps."
-        ))
-
-    # 5. Insecure security
-    if security and any(weak in security.lower() for weak in ["none", "open", "wep"]):
-        report_status = "WARNING"
-        issues.append((
-            "WARNING",
-            f"Insecure Wi-Fi security ({security}). Traffic is unencrypted over the air."
-        ))
-        recommendations.append("Configure WPA2 or WPA3 encryption on your router.")
-
-    if report_status == "OK":
-        summary = "Wi-Fi link is healthy with modern standard and good signal."
-    else:
-        summary = "Wi-Fi bottleneck detected (check frequency band, link rate, or signal)."
-
-    return DiagnosticReport(
-        title="Wi-Fi Link Info",
-        status=report_status,
-        summary=summary,
-        findings=findings,
-        issues=issues,
-        recommendations=recommendations,
-        raw=raw,
-    )
-
-
-def _to_mbps(val, unit):
-    """Normalize throughput value to Mbps."""
-    if val is None or not unit:
-        return None
-    u = unit.lower()
-    if "g" in u:
-        return val * 1000.0
-    elif "k" in u:
-        return val / 1000.0
-    return val
-
-
-def parse_networkquality_output(ok, out, err, cmd=""):
-    """Parse networkQuality CLI output."""
-    raw = out if ok else (err or out)
-    if not ok:
-        if "command not found" in (err or out).lower():
-            return DiagnosticReport(
-                title="Network Quality Test",
-                status="INFO",
-                summary="networkQuality command not available on this macOS version.",
-                issues=[("INFO", "networkQuality requires macOS 12 (Monterey) or later.")],
-                recommendations=["Upgrade macOS to Monterey or later to use the built-in responsiveness test."],
-                raw=raw,
-            )
-        return DiagnosticReport(
-            title="Network Quality Test",
-            status="ERROR",
-            summary="Network quality test failed or timed out.",
-            issues=[("ERROR", f"Test error: {err or out}")],
-            recommendations=["Verify active internet connectivity and test server accessibility."],
-            raw=raw,
-        )
-
-    findings = []
-    issues = []
-    recommendations = []
-
-    # Uplink / Downlink capacity
-    ul_match = re.search(r'Uplink capacity:\s*([\d\.]+)\s*(\w+ps)', out)
-    dl_match = re.search(r'Downlink capacity:\s*([\d\.]+)\s*(\w+ps)', out)
-    ul_val = float(ul_match.group(1)) if ul_match else None
-    ul_unit = ul_match.group(2) if ul_match else "Mbps"
-    dl_val = float(dl_match.group(1)) if dl_match else None
-    dl_unit = dl_match.group(2) if dl_match else "Mbps"
-
-    dl_mbps = _to_mbps(dl_val, dl_unit)
-    ul_mbps = _to_mbps(ul_val, ul_unit)
-
-    # Responsiveness
-    resp_rating = None
-    resp_ms = None
-    resp_rpm = None
-    m_resp1 = re.search(r'Responsiveness:\s*(\w+)\s*\(([\d\.]+)\s*milliseconds\s*\|\s*(\d+)\s*RPM\)', out)
-    if m_resp1:
-        resp_rating = m_resp1.group(1)
-        resp_ms = float(m_resp1.group(2))
-        resp_rpm = int(m_resp1.group(3))
-    else:
-        m_resp2 = re.search(r'Responsiveness:\s*(\w+)\s*\n\s*(\d+)\s*RPM\s*\(([\d\.]+)\s*milliseconds\)', out)
-        if m_resp2:
-            resp_rating = m_resp2.group(1)
-            resp_rpm = int(m_resp2.group(2))
-            resp_ms = float(m_resp2.group(3))
-        else:
-            m_resp3 = re.search(r'Responsiveness:\s*(\w+)', out)
-            if m_resp3:
-                resp_rating = m_resp3.group(1)
-
-    # Idle Latency
-    idle_ms = None
-    idle_rpm = None
-    m_idle1 = re.search(r'Idle Latency:\s*([\d\.]+)\s*milliseconds(?:\s*\|\s*(\d+)\s*RPM)?', out)
-    if m_idle1:
-        idle_ms = float(m_idle1.group(1))
-        if m_idle1.group(2):
-            idle_rpm = int(m_idle1.group(2))
-    else:
-        m_idle2 = re.search(r'Idle Latency:\s*\n\s*(?:(\d+)\s*RPM\s*\()?([\d\.]+)\s*milliseconds', out)
-        if m_idle2:
-            idle_ms = float(m_idle2.group(2))
-            if m_idle2.group(1):
-                idle_rpm = int(m_idle2.group(1))
-
-    # Endpoint & Interface
-    ep_match = re.search(r'Test Endpoint:\s*([^\n\r]+)', out)
-    test_ep = ep_match.group(1).strip() if ep_match else None
-    iface_match = re.search(r'Interface:\s*([^\n\r]+)', out)
-    test_iface = iface_match.group(1).strip() if iface_match else None
-
-    # ECN / L4S
-    ecn_match = re.search(r'ECN\s*(Disabled|Enabled)', out, re.IGNORECASE)
-    ecn_status = ecn_match.group(1) if ecn_match else None
-
-    # Compile findings
-    if dl_val is not None:
-        findings.append(("Downlink Speed", f"{dl_val:.2f} {dl_unit}"))
-    if ul_val is not None:
-        findings.append(("Uplink Speed", f"{ul_val:.2f} {ul_unit}"))
-
-    if resp_rating:
-        detail = []
-        if resp_rpm:
-            detail.append(f"{resp_rpm} RPM")
-        if resp_ms:
-            detail.append(f"{resp_ms:.1f} ms loaded latency")
-        resp_str = f"{resp_rating} ({', '.join(detail)})" if detail else resp_rating
-        findings.append(("Responsiveness", resp_str))
-
-    if idle_ms is not None:
-        findings.append(("Idle Latency", f"{idle_ms:.1f} ms{f' ({idle_rpm} RPM)' if idle_rpm else ''}"))
-
-    if idle_ms is not None and resp_ms is not None:
-        bloat_ms = resp_ms - idle_ms
-        findings.append(("Bufferbloat Delta", f"+{bloat_ms:.1f} ms additional delay under saturation"))
-
-    if test_ep:
-        findings.append(("Test Endpoint", test_ep))
-    if test_iface:
-        findings.append(("Tested Interface", test_iface))
-    if ecn_status:
-        findings.append(("ECN Status", ecn_status))
-
-    # Evaluate issues
-    report_status = "OK"
-
-    # Bufferbloat evaluation
-    if resp_rating == "Low" or (resp_rpm and resp_rpm < 100) or (resp_ms and resp_ms > 250):
-        report_status = "WARNING"
-        bloat_str = f" (+{resp_ms - idle_ms:.0f} ms bloat)" if (idle_ms and resp_ms) else ""
-        issues.append((
-            "WARNING",
-            f"Severe Bufferbloat Detected: Responsiveness rated Low ({resp_rpm or 'N/A'} RPM, {resp_ms or 'N/A'} ms loaded latency){bloat_str}. "
-            "Network queues in your router/modem are filling with packets, causing ping spikes, video call lag, and stuttering during downloads."
-        ))
-        recommendations.append(
-            "Enable Smart Queue Management (SQM, e.g. CAKE or FQ-CoDel) on your home router."
-        )
-        recommendations.append(
-            "In TCP Optimizer, the 'Low-Latency / Gaming' preset sets delayed_ack=0 to prioritize responsiveness."
-        )
-    elif resp_rating == "Medium":
-        issues.append((
-            "INFO",
-            f"Moderate Bufferbloat: Responsiveness rated Medium ({resp_rpm or 'N/A'} RPM). Noticeable delay may occur during large file transfers."
-        ))
-
-    # Low capacity
-    if dl_mbps is not None and dl_mbps < 25.0:
-        if report_status != "ERROR":
-            report_status = "WARNING"
-        issues.append((
-            "WARNING",
-            f"Low Downlink Capacity ({dl_val:.1f} {dl_unit}). If you pay for high-speed broadband, the bottleneck is "
-            "likely Wi-Fi band/interference, cable limitations, or ISP congestion rather than TCP window settings."
-        ))
-        recommendations.append("Check Wi-Fi band (switch to 5 GHz) or test via a direct wired Ethernet cable.")
-
-    # High idle ping
-    if idle_ms is not None and idle_ms > 80.0:
-        issues.append((
-            "WARNING",
-            f"High Base Latency ({idle_ms:.1f} ms). Idle ping to test server is elevated, suggesting upstream routing delays or geographic distance."
-        ))
-
-    if report_status == "OK":
-        summary = "Network capacity and latency responsiveness are optimal."
-    else:
-        summary = "Network issues detected (bufferbloat or limited throughput)."
-
-    return DiagnosticReport(
-        title="Network Quality Test",
-        status=report_status,
-        summary=summary,
-        findings=findings,
-        issues=issues,
-        recommendations=recommendations,
-        raw=raw,
-    )
-
-
-def parse_ifconfig_output(ok, out, err, cmd=""):
-    """Parse ifconfig CLI output."""
-    raw = out if ok else (err or out)
-    if not ok:
-        return DiagnosticReport(
-            title="Interfaces + MTU",
-            status="ERROR",
-            summary="Failed to run ifconfig.",
-            issues=[("ERROR", f"Command error: {err or out}")],
-            recommendations=["Verify network permissions."],
-            raw=raw,
-        )
-
-    blocks = {}
-    current_if = None
-    for line in out.splitlines():
-        m = re.match(r'^([a-zA-Z0-9]+):\s*flags=\d+<([^>]+)>\s*mtu\s*(\d+)', line)
-        if m:
-            current_if = m.group(1)
-            blocks[current_if] = {
-                "name": current_if,
-                "flags": m.group(2).split(","),
-                "mtu": int(m.group(3)),
-                "ipv4": [],
-                "ipv6": [],
-                "status": None,
-                "media": None,
-                "mac": None,
-            }
-        elif current_if:
-            s_line = line.strip()
-            if s_line.startswith("status:"):
-                blocks[current_if]["status"] = s_line.split("status:", 1)[1].strip()
-            elif s_line.startswith("media:"):
-                blocks[current_if]["media"] = s_line.split("media:", 1)[1].strip()
-            elif s_line.startswith("ether "):
-                blocks[current_if]["mac"] = s_line.split("ether ", 1)[1].strip()
-            elif s_line.startswith("inet "):
-                parts = s_line.split()
-                if len(parts) >= 2:
-                    ip = parts[1]
-                    netmask = parts[3] if "netmask" in parts and len(parts) > parts.index("netmask") + 1 else None
-                    blocks[current_if]["ipv4"].append((ip, netmask))
-            elif s_line.startswith("inet6 "):
-                parts = s_line.split()
-                if len(parts) >= 2:
-                    blocks[current_if]["ipv6"].append(parts[1])
-
-    findings = []
-    issues = []
-    recommendations = []
-    report_status = "OK"
-
-    active_physical = []
-    active_tunnels = []
-
-    for name, data in blocks.items():
-        if name == "lo0":
-            continue
-        is_active = (data["status"] == "active") or bool(data["ipv4"])
-        if is_active:
-            if name.startswith("utun"):
-                active_tunnels.append(data)
-            else:
-                active_physical.append(data)
-
-    if not active_physical and not active_tunnels:
-        return DiagnosticReport(
-            title="Interfaces + MTU",
-            status="ERROR",
-            summary="No active network interfaces detected.",
-            issues=[("ERROR", "All network interfaces are inactive or missing IP addresses.")],
-            recommendations=["Check network cable or reconnect to Wi-Fi in macOS System Settings."],
-            raw=raw,
-        )
-
-    for iface in active_physical:
-        name = iface["name"]
-        mtu = iface["mtu"]
-        ipv4_strs = [f"{ip}" for ip, nm in iface["ipv4"]]
-        media_val = iface["media"] or "N/A"
-
-        desc = f"MTU {mtu}"
-        if ipv4_strs:
-            desc += f", IPv4: {', '.join(ipv4_strs)}"
-        if iface["media"]:
-            desc += f", Media: {iface['media']}"
-        findings.append((f"Interface {name}", desc))
-
-        # Check for APIPA / DHCP failure (169.254.x.x)
-        for ip, _ in iface["ipv4"]:
-            if ip.startswith("169.254."):
-                report_status = "ERROR"
-                issues.append((
-                    "ERROR",
-                    f"Self-assigned IP address ({ip}) on {name}. Device failed to receive a valid DHCP lease from your router."
-                ))
-                recommendations.append(
-                    "Renew DHCP lease in Network Settings, check Wi-Fi password, or reboot your router/modem."
-                )
-
-        # Check for 100baseTX Ethernet Bottleneck
-        if "100basetx" in media_val.lower():
-            report_status = "WARNING"
-            issues.append((
-                "WARNING",
-                f"Wired Ethernet link on {name} negotiated at only 100 Mbps (100baseTX) instead of Gigabit (1000baseT). "
-                "This physically caps download/upload speeds to ~94 Mbps! Often caused by a damaged 8-pin Ethernet cable "
-                "(missing pairs), poor wall jack termination, or an older 10/100 switch."
-            ))
-            recommendations.append(
-                "Replace Ethernet cable with a Cat5e or Cat6 cable, test another router port, or check USB-C Ethernet adapter."
-            )
-
-        # Check for Half-Duplex
-        if "half-duplex" in media_val.lower():
-            report_status = "ERROR"
-            issues.append((
-                "ERROR",
-                f"Interface {name} is running in half-duplex! Ethernet collisions will cause massive packet loss and throughput collapse."
-            ))
-            recommendations.append("Force full-duplex negotiation in Network Settings > Hardware or replace cable.")
-
-        # Check MTU anomalies
-        if mtu < 1500:
-            if report_status != "ERROR":
-                report_status = "WARNING"
-            issues.append((
-                "WARNING",
-                f"Sub-standard MTU ({mtu} bytes) on {name} (standard Ethernet is 1500). Packets larger than {mtu} bytes will be "
-                "fragmented. If Path MTU Discovery (PMTUD) is blocked by intermediate firewalls, connections may hang or stall."
-            ))
-            recommendations.append(
-                f"Ensure macOS sysctl net.inet.tcp.mssdflt is tuned for this MTU ({mtu - 40} bytes)."
-            )
-        elif mtu > 1500:
-            findings.append((f"Jumbo MTU on {name}", f"{mtu} bytes (Ensure all LAN switches support Jumbo Frames)"))
-
-    if active_tunnels:
-        tun_names = [t["name"] for t in active_tunnels]
-        tun_mtus = [f"{t['name']}: {t['mtu']}" for t in active_tunnels[:4]]
-        findings.append(("Active VPN Tunnels", f"{len(active_tunnels)} tunnel(s) active ({', '.join(tun_names[:4])})"))
-        findings.append(("Tunnel MTUs", ", ".join(tun_mtus)))
-        issues.append((
-            "INFO",
-            f"{len(active_tunnels)} active tunnel interface(s) (VPN or iCloud Private Relay). "
-            "VPN tunnel encapsulation and encryption overhead can reduce peak throughput."
-        ))
-
-    if report_status == "OK":
-        summary = f"All {len(active_physical)} active physical interface(s) configured normally."
-    else:
-        summary = "Interface misconfiguration or physical speed limitation detected."
-
-    return DiagnosticReport(
-        title="Interfaces + MTU",
-        status=report_status,
-        summary=summary,
-        findings=findings,
-        issues=issues,
-        recommendations=recommendations,
-        raw=raw,
-    )
-
-
-def parse_dns_output(ok, out, err, cmd=""):
-    """Parse DNS CLI output (dig or nslookup)."""
-    raw = out if ok else (err or out)
-    if not ok:
-        return DiagnosticReport(
-            title="DNS Lookup",
-            status="ERROR",
-            summary="DNS resolution failed completely.",
-            issues=[("ERROR", f"Lookup failed: {err or out}")],
-            recommendations=[
-                "Check DNS resolver settings in macOS System Settings > Network.",
-                "Configure reliable public DNS servers like Cloudflare (1.1.1.1) or Google (8.8.8.8).",
-            ],
-            raw=raw,
-        )
-
-    findings = []
-    issues = []
-    recommendations = []
-    report_status = "OK"
-
-    is_dig = ";; ->>HEADER<<-" in out or ";; Query time:" in out
-
-    query_time_ms = None
-    dns_server = None
-    dns_status = None
-    resolved_ips = []
-
-    if is_dig:
-        m_status = re.search(r'status:\s*([A-Z]+)', out)
-        if m_status:
-            dns_status = m_status.group(1)
-
-        m_time = re.search(r';;\s*Query time:\s*(\d+)\s*msec', out)
-        if m_time:
-            query_time_ms = int(m_time.group(1))
-
-        m_srv = re.search(r';;\s*SERVER:\s*([^\n\r]+)', out)
-        if m_srv:
-            dns_server = m_srv.group(1).strip()
-
-        in_answer = False
-        for line in out.splitlines():
-            if line.startswith(";; ANSWER SECTION:"):
-                in_answer = True
-                continue
-            elif in_answer and line.startswith(";;"):
-                in_answer = False
-            elif in_answer and line.strip():
-                parts = line.split()
-                if len(parts) >= 5 and parts[3] in ("A", "AAAA"):
-                    resolved_ips.append(parts[4])
-    else:
-        m_srv = re.search(r'Server:\s*([^\n\r]+)', out)
-        m_addr = re.search(r'Address:\s*([^\n\r]+)', out)
-        if m_srv:
-            dns_server = m_srv.group(1).strip()
-            if m_addr:
-                dns_server += f" ({m_addr.group(1).strip()})"
-        for m in re.finditer(r'Address:\s*([0-9\.]+)', out):
-            ip_found = m.group(1).strip()
-            if dns_server and ip_found not in dns_server:
-                resolved_ips.append(ip_found)
-        if "** server can't find" in out or "connection timed out" in out.lower():
-            dns_status = "SERVFAIL"
-        else:
-            dns_status = "NOERROR"
-
-    if dns_status and dns_status != "NOERROR":
-        report_status = "ERROR"
-        issues.append((
-            "ERROR",
-            f"DNS query returned error status: {dns_status}. Hostnames cannot be resolved."
-        ))
-        recommendations.append("Switch DNS resolver to 1.1.1.1 or 8.8.8.8 in macOS Network Settings.")
-
-    if query_time_ms is not None:
-        if query_time_ms < 25:
-            speed_rating = "Excellent (Fast)"
-        elif query_time_ms < 60:
-            speed_rating = "Good (Normal)"
-        elif query_time_ms < 150:
-            speed_rating = "Moderate / Sluggish"
-        else:
-            speed_rating = "High Latency (Slow)"
-        findings.append(("Query Latency", f"{query_time_ms} ms ({speed_rating})"))
-
-        if query_time_ms > 150:
-            report_status = "WARNING"
-            issues.append((
-                "WARNING",
-                f"Slow DNS Resolution ({query_time_ms} ms). High DNS lookup latency adds delay to every new connection "
-                "before TCP handshake begins, making web browsing and network apps feel sluggish."
-            ))
-            recommendations.append(
-                "Configure faster DNS resolvers such as Cloudflare (1.1.1.1, 1.0.0.1) or Google (8.8.8.8, 8.8.4.4)."
-            )
-        elif query_time_ms > 60:
-            issues.append((
-                "INFO",
-                f"Slightly elevated DNS latency ({query_time_ms} ms). Public anycast DNS may offer faster lookups."
-            ))
-
-    if dns_server:
-        findings.append(("DNS Resolver", dns_server))
-        is_private = False
-        m_ip = re.search(r'(\d+\.\d+\.\d+\.\d+)', dns_server)
-        if m_ip:
-            try:
-                ip_obj = ipaddress.ip_address(m_ip.group(1))
-                is_private = ip_obj.is_private
-            except ValueError:
-                pass
-        if is_private and query_time_ms and query_time_ms > 40:
-            issues.append((
-                "INFO",
-                f"DNS queries are relayed through local router ({m_ip.group(1)}). Some consumer routers have weak DNS proxy performance."
-            ))
-
-    if dns_status:
-        findings.append(("Response Status", dns_status))
-    if resolved_ips:
-        findings.append(("Resolved Addresses", ", ".join(resolved_ips[:4])))
-
-    if report_status == "OK":
-        summary = f"DNS resolution is fast and functional ({query_time_ms or '<25'} ms)."
-    elif report_status == "WARNING":
-        summary = f"DNS latency is elevated ({query_time_ms} ms)."
-    else:
-        summary = f"DNS resolution failed ({dns_status or 'Error'})."
-
-    return DiagnosticReport(
-        title="DNS Lookup",
-        status=report_status,
-        summary=summary,
-        findings=findings,
-        issues=issues,
-        recommendations=recommendations,
-        raw=raw,
-    )
+def read_all_tcp_sysctls():
+    """Return a dict of current values for all known TCP_KEYS."""
+    return {key: read_sysctl(key) for key in TCP_KEYS}
 
 
 class TCPOptimizerApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("760x620")
+        self.root.geometry("820x660")
         self.entries = {}
+        self._diag_history = []  # list of (DiagnosticReport, cmd_str)
+        self._diag_queue = queue.Queue()
+        self._diag_running = False
+        self._diag_buttons = []
 
         if not is_macos():
             messagebox.showwarning(
@@ -1024,24 +252,26 @@ class TCPOptimizerApp:
             "and the actual server/link you're testing against are the more "
             "common bottlenecks on a MacBook Air."
         )
-        lbl = tk.Label(f, text=note, wraplength=700, justify="left", fg="#444")
+        lbl = tk.Label(f, text=note, wraplength=740, justify="left", fg="#444")
         lbl.pack(anchor="w", padx=10, pady=(10, 6))
 
         btn_row = ttk.Frame(f)
         btn_row.pack(fill="x", padx=10, pady=4)
         ttk.Button(btn_row, text="Refresh current values", command=self.refresh_overview).pack(side="left")
 
-        self.overview_text = scrolledtext.ScrolledText(f, height=22, font=("Menlo", 11))
+        self.overview_text = scrolledtext.ScrolledText(f, height=22, font=("Menlo", 11), state="disabled")
         self.overview_text.pack(fill="both", expand=True, padx=10, pady=8)
         self.refresh_overview()
 
     def refresh_overview(self):
-        self.overview_text.delete("1.0", tk.END)
         lines = []
         for key, meta in TCP_KEYS.items():
             val = read_sysctl(key)
             lines.append(f"{key:38s} = {val if val is not None else 'unavailable':>10}   ({meta['label']})")
+        self.overview_text.config(state="normal")
+        self.overview_text.delete("1.0", tk.END)
         self.overview_text.insert(tk.END, "\n".join(lines))
+        self.overview_text.config(state="disabled")
 
     # ------------------------------------------------------------------ #
     # Presets
@@ -1061,7 +291,7 @@ class TCPOptimizerApp:
             ttk.Button(row, text=f"Apply: {name}", width=32,
                        command=lambda n=name: self.apply_preset(n)).pack(side="left")
 
-        self.preset_status = tk.Label(f, text="", fg="#0a7a0a", wraplength=700, justify="left")
+        self.preset_status = tk.Label(f, text="", fg="#0a7a0a", wraplength=740, justify="left")
         self.preset_status.pack(anchor="w", padx=10, pady=10)
 
     def apply_preset(self, name):
@@ -1106,7 +336,7 @@ class TCPOptimizerApp:
             entry.grid(row=0, column=1, padx=6)
             tk.Label(row, text=f"({meta['min']}\u2013{meta['max']})", fg="#777").grid(row=0, column=2, padx=4)
             self.entries[key] = var
-            tk.Label(row, text=meta["help"], fg="#666", wraplength=520, justify="left").grid(
+            tk.Label(row, text=meta["help"], fg="#666", wraplength=540, justify="left").grid(
                 row=1, column=0, columnspan=3, sticky="w", pady=(2, 0)
             )
 
@@ -1115,7 +345,7 @@ class TCPOptimizerApp:
         ttk.Button(btn_row, text="Reload current values", command=self.reload_advanced).pack(side="left", padx=4)
         ttk.Button(btn_row, text="Apply all changed values", command=self.apply_advanced).pack(side="left", padx=4)
 
-        self.advanced_status = tk.Label(inner, text="", fg="#0a7a0a", wraplength=650, justify="left")
+        self.advanced_status = tk.Label(inner, text="", fg="#0a7a0a", wraplength=680, justify="left")
         self.advanced_status.pack(anchor="w", padx=6, pady=6)
 
     def reload_advanced(self):
@@ -1164,23 +394,50 @@ class TCPOptimizerApp:
         f = self.tab_diag
         tk.Label(
             f, text="Run these before assuming TCP tuning is the fix \u2014 they "
-                    "separate a real TCP-stack limit from Wi‑Fi, DNS, or "
-                    "server-side bottlenecks. Each check analyzes the results "
-                    "for bottlenecks and misconfigurations before showing the raw tool output.",
-            wraplength=700, justify="left", fg="#444"
-        ).pack(anchor="w", padx=10, pady=10)
+                    "separate a real TCP-stack limit from Wi‑Fi, DNS, packet loss, or "
+                    "server-side bottlenecks. Each check parses the CLI output for "
+                    "misconfigurations and bottlenecks before showing the raw output.",
+            wraplength=740, justify="left", fg="#444"
+        ).pack(anchor="w", padx=10, pady=(10, 6))
 
-        btns = ttk.Frame(f)
-        btns.pack(fill="x", padx=10)
-        ttk.Button(btns, text="Wi-Fi link info", command=self.diag_wifi).pack(side="left", padx=4)
-        ttk.Button(btns, text="Network Quality Test", command=self.diag_networkquality).pack(side="left", padx=4)
-        ttk.Button(btns, text="Interface + MTU", command=self.diag_ifconfig).pack(side="left", padx=4)
-        ttk.Button(btns, text="DNS latency", command=self.diag_dns).pack(side="left", padx=4)
-        ttk.Button(btns, text="Run All Checks", command=self.diag_all).pack(side="left", padx=4)
-        ttk.Button(btns, text="Clear", command=self.diag_clear).pack(side="right", padx=4)
+        btns_row1 = ttk.Frame(f)
+        btns_row1.pack(fill="x", padx=10, pady=(2, 2))
+        btn_specs = [
+            ("Wi-Fi link info", self.diag_wifi),
+            ("Network Quality Test", self.diag_networkquality),
+            ("Interface + MTU", self.diag_ifconfig),
+            ("DNS latency", self.diag_dns),
+            ("Gateway + Ping", self.diag_ping),
+            ("TCP + Socket Stats", self.diag_tcp_stats),
+        ]
+        for label, cmd_fn in btn_specs:
+            b = ttk.Button(btns_row1, text=label, command=cmd_fn)
+            b.pack(side="left", padx=3)
+            self._diag_buttons.append(b)
 
-        self.diag_text = scrolledtext.ScrolledText(f, height=22, font=("Menlo", 11))
-        self.diag_text.pack(fill="both", expand=True, padx=10, pady=8)
+        btns_row2 = ttk.Frame(f)
+        btns_row2.pack(fill="x", padx=10, pady=(2, 4))
+        b_all = ttk.Button(btns_row2, text="Run All Checks", command=self.diag_all)
+        b_all.pack(side="left", padx=3)
+        self._diag_buttons.append(b_all)
+
+        self.show_raw_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            btns_row2,
+            text="Show raw CLI output",
+            variable=self.show_raw_var,
+            command=self._rerender_diag_history,
+        ).pack(side="left", padx=10)
+
+        self.diag_status_lbl = tk.Label(btns_row2, text="", fg="#0055aa")
+        self.diag_status_lbl.pack(side="left", padx=8)
+
+        b_clear = ttk.Button(btns_row2, text="Clear", command=self.diag_clear)
+        b_clear.pack(side="right", padx=3)
+        self._diag_buttons.append(b_clear)
+
+        self.diag_text = scrolledtext.ScrolledText(f, height=22, font=("Menlo", 11), state="disabled")
+        self.diag_text.pack(fill="both", expand=True, padx=10, pady=6)
 
         # Configure style tags for diagnostic reporting
         self.diag_text.tag_configure("divider", foreground="#888888")
@@ -1199,7 +456,10 @@ class TCPOptimizerApp:
         self.diag_text.tag_configure("raw_hdr", font=("Menlo", 10, "bold"), foreground="#555555")
         self.diag_text.tag_configure("raw_body", font=("Menlo", 10))
 
-    def _diag_write_report(self, report, cmd=""):
+    def _insert_diag_report_into_widget(self, report, cmd=""):
+        """Insert a single DiagnosticReport into `self.diag_text`."""
+        include_raw = self.show_raw_var.get()
+        self.diag_text.config(state="normal")
         self.diag_text.insert(tk.END, "=" * 76 + "\n", "divider")
         self.diag_text.insert(tk.END, f"  DIAGNOSTIC REPORT: {report.title.upper()}\n", "diag_title")
         self.diag_text.insert(tk.END, "=" * 76 + "\n", "divider")
@@ -1235,16 +495,96 @@ class TCPOptimizerApp:
                 self.diag_text.insert(tk.END, f"{rec}\n", "rec")
             self.diag_text.insert(tk.END, "\n")
 
-        cmd_label = f" ({cmd})" if cmd else ""
-        self.diag_text.insert(tk.END, "-" * 76 + "\n", "divider")
-        self.diag_text.insert(tk.END, f"RAW CLI OUTPUT{cmd_label}\n", "raw_hdr")
-        self.diag_text.insert(tk.END, "-" * 76 + "\n", "divider")
-        raw_body = report.raw.strip() if report.raw.strip() else "(no output)"
-        self.diag_text.insert(tk.END, f"{raw_body}\n", "raw_body")
+        if include_raw:
+            cmd_label = f" ({cmd})" if cmd else ""
+            self.diag_text.insert(tk.END, "-" * 76 + "\n", "divider")
+            self.diag_text.insert(tk.END, f"RAW CLI OUTPUT{cmd_label}\n", "raw_hdr")
+            self.diag_text.insert(tk.END, "-" * 76 + "\n", "divider")
+            raw_body = report.raw.strip() if report.raw.strip() else "(no output)"
+            self.diag_text.insert(tk.END, f"{raw_body}\n", "raw_body")
         self.diag_text.insert(tk.END, "=" * 76 + "\n\n", "divider")
         self.diag_text.see(tk.END)
+        self.diag_text.config(state="disabled")
 
-    def diag_wifi(self):
+    def _diag_write_report(self, report, cmd=""):
+        self._diag_history.append((report, cmd))
+        self._insert_diag_report_into_widget(report, cmd=cmd)
+
+    def _rerender_diag_history(self):
+        self.diag_text.config(state="normal")
+        self.diag_text.delete("1.0", tk.END)
+        self.diag_text.config(state="disabled")
+        for report, cmd in self._diag_history:
+            self._insert_diag_report_into_widget(report, cmd=cmd)
+
+    def _set_diag_busy(self, busy, status_text=""):
+        self._diag_running = busy
+        btn_state = "disabled" if busy else "normal"
+        for b in self._diag_buttons:
+            b.config(state=btn_state)
+        self.diag_status_lbl.config(text=status_text)
+
+    def _poll_diag_queue(self):
+        """Drain diagnostic results queued by background worker threads on the UI thread."""
+        done = False
+        while True:
+            try:
+                item = self._diag_queue.get_nowait()
+            except queue.Empty:
+                break
+            kind = item[0]
+            if kind == "report":
+                _, report, cmd = item
+                self._diag_write_report(report, cmd=cmd)
+            elif kind == "status":
+                _, msg = item
+                self.diag_status_lbl.config(text=msg)
+            elif kind == "done":
+                done = True
+        if done:
+            self._set_diag_busy(False, "")
+        elif self._diag_running:
+            self.root.after(50, self._poll_diag_queue)
+
+    def _run_diag_async(self, status_text, worker_fn):
+        """Run diagnostic collection off the main thread so the UI stays responsive."""
+        if self._diag_running:
+            return
+        while not self._diag_queue.empty():
+            try:
+                self._diag_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self._set_diag_busy(True, status_text)
+        self.root.after(50, self._poll_diag_queue)
+
+        def emit(report, cmd=""):
+            self._diag_queue.put(("report", report, cmd))
+
+        def update_status(msg):
+            self._diag_queue.put(("status", msg))
+
+        def target():
+            try:
+                worker_fn(emit, update_status)
+            except Exception as e:
+                from diagnostics import DiagnosticReport
+                err_rep = DiagnosticReport(
+                    title="Diagnostic Error",
+                    status="ERROR",
+                    summary=f"Unexpected error: {e}",
+                    issues=[("ERROR", str(e))],
+                    raw=str(e),
+                )
+                emit(err_rep, "")
+            finally:
+                self._diag_queue.put(("done",))
+
+        threading.Thread(target=target, daemon=True).start()
+
+    # --- Diagnostic Collectors (safe to call on worker thread or synchronously) ---
+    def _collect_wifi(self):
         airport = (
             "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/"
             "Current/Resources/airport"
@@ -1255,41 +595,119 @@ class TCPOptimizerApp:
         else:
             cmd = "system_profiler SPAirPortDataType"
             ok, out, err = run(["system_profiler", "SPAirPortDataType"])
-        report = parse_wifi_output(ok, out, err, cmd=cmd)
-        self._diag_write_report(report, cmd=cmd)
+        sysctls = read_all_tcp_sysctls()
+        return parse_wifi_output(ok, out, err, cmd=cmd, sysctls=sysctls), cmd
 
-    def diag_networkquality(self):
-        self.diag_text.insert(tk.END, "\nRunning networkQuality \u2014 this can take ~20-30s...\n", "status_info")
-        self.diag_text.see(tk.END)
-        self.root.update()
+    def _collect_networkquality(self):
         cmd = "networkQuality -v"
         ok, out, err = run(["networkQuality", "-v"], timeout=60)
-        report = parse_networkquality_output(ok, out, err, cmd=cmd)
-        self._diag_write_report(report, cmd=cmd)
+        sysctls = read_all_tcp_sysctls()
+        return parse_networkquality_output(ok, out, err, cmd=cmd, sysctls=sysctls), cmd
 
-    def diag_ifconfig(self):
+    def _collect_ifconfig(self):
         cmd = "ifconfig"
         ok, out, err = run(["ifconfig"])
-        report = parse_ifconfig_output(ok, out, err, cmd=cmd)
-        self._diag_write_report(report, cmd=cmd)
+        sysctls = read_all_tcp_sysctls()
+        return parse_ifconfig_output(ok, out, err, cmd=cmd, sysctls=sysctls), cmd
 
-    def diag_dns(self):
-        cmd = "dig example.com"
-        ok, out, err = run(["dig", "example.com"])
+    def _collect_dns(self):
+        cmd = "dig +tries=1 +time=3 example.com"
+        t0 = time.monotonic()
+        ok, out, err = run(["dig", "+tries=1", "+time=3", "example.com"])
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
         if not ok:
             cmd = "nslookup example.com"
+            t0 = time.monotonic()
             ok, out, err = run(["nslookup", "example.com"])
-        report = parse_dns_output(ok, out, err, cmd=cmd)
-        self._diag_write_report(report, cmd=cmd)
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+        comp_ok, comp_out, _ = run(["dig", "+tries=1", "+time=3", "@1.1.1.1", "example.com"], timeout=5)
+        sc_ok, sc_out, _ = run(["scutil", "--dns"], timeout=5)
+        report = parse_dns_output(
+            ok,
+            out,
+            err,
+            cmd=cmd,
+            elapsed_ms=elapsed_ms,
+            comparison_ok=comp_ok,
+            comparison_out=comp_out if comp_ok else None,
+            scutil_out=sc_out if sc_ok else None,
+        )
+        return report, cmd
+
+    def _collect_ping(self):
+        route_ok, route_out, _ = run(["route", "-n", "get", "default"], timeout=5)
+        gw_ip, gw_iface = extract_default_gateway(route_out) if route_ok else (None, None)
+        if gw_ip:
+            gw_ok, gw_out, gw_err = run(["ping", "-c", "6", "-i", "0.2", gw_ip], timeout=10)
+        else:
+            gw_ok, gw_out, gw_err = False, "", "No default gateway"
+        inet_target = "1.1.1.1"
+        inet_ok, inet_out, inet_err = run(["ping", "-c", "6", "-i", "0.2", inet_target], timeout=10)
+        report = parse_ping_output(
+            gw_ip, gw_iface, gw_ok, gw_out, gw_err,
+            inet_ok, inet_out, inet_err, inet_target=inet_target,
+        )
+        cmd = f"ping -c 6 {gw_ip or '<none>'} ; ping -c 6 {inet_target}"
+        return report, cmd
+
+    def _collect_tcp_stats(self):
+        in_ok, in_out, in_err = run(["netstat", "-in"], timeout=10)
+        s_ok, s_out, s_err = run(["netstat", "-s", "-p", "tcp"], timeout=10)
+        anv_ok, anv_out, anv_err = run(["netstat", "-anv", "-p", "tcp"], timeout=10)
+        sysctls = read_all_tcp_sysctls()
+        report = parse_tcp_stats_output(
+            in_ok, in_out, in_err,
+            s_ok, s_out, s_err,
+            anv_ok, anv_out, anv_err,
+            sysctls=sysctls,
+        )
+        return report, "netstat -in ; netstat -s -p tcp ; netstat -anv -p tcp"
+
+    # --- UI Diagnostic Button Handlers ---
+    def diag_wifi(self):
+        self._run_diag_async("Checking Wi-Fi link...", lambda emit, _: emit(*self._collect_wifi()))
+
+    def diag_networkquality(self):
+        self._run_diag_async(
+            "Running networkQuality (~20-30s)...",
+            lambda emit, _: emit(*self._collect_networkquality()),
+        )
+
+    def diag_ifconfig(self):
+        self._run_diag_async("Checking interfaces + MTU...", lambda emit, _: emit(*self._collect_ifconfig()))
+
+    def diag_dns(self):
+        self._run_diag_async("Checking DNS latency & resolvers...", lambda emit, _: emit(*self._collect_dns()))
+
+    def diag_ping(self):
+        self._run_diag_async("Pinging gateway & 1.1.1.1...", lambda emit, _: emit(*self._collect_ping()))
+
+    def diag_tcp_stats(self):
+        self._run_diag_async("Collecting TCP & interface counters...", lambda emit, _: emit(*self._collect_tcp_stats()))
 
     def diag_all(self):
-        self.diag_wifi()
-        self.diag_ifconfig()
-        self.diag_dns()
-        self.diag_networkquality()
+        def worker(emit, update_status):
+            steps = [
+                ("1/6 Checking Wi-Fi link...", self._collect_wifi),
+                ("2/6 Checking interfaces + MTU...", self._collect_ifconfig),
+                ("3/6 Checking DNS latency...", self._collect_dns),
+                ("4/6 Pinging gateway & 1.1.1.1...", self._collect_ping),
+                ("5/6 Collecting TCP & socket stats...", self._collect_tcp_stats),
+                ("6/6 Running networkQuality (~20-30s)...", self._collect_networkquality),
+            ]
+            for label, fn in steps:
+                update_status(label)
+                emit(*fn())
+
+        self._run_diag_async("Running all diagnostic checks...", worker)
 
     def diag_clear(self):
+        if self._diag_running:
+            return
+        self._diag_history.clear()
+        self.diag_text.config(state="normal")
         self.diag_text.delete("1.0", tk.END)
+        self.diag_text.config(state="disabled")
 
     # ------------------------------------------------------------------ #
     # Persistence (LaunchDaemon so presets survive reboot)
@@ -1300,7 +718,7 @@ class TCPOptimizerApp:
             f, text="sysctl -w changes are reset on reboot. Installing this "
                     "LaunchDaemon re-applies your last-applied preset at every "
                     "boot by running a small root-owned script.",
-            wraplength=700, justify="left", fg="#444"
+            wraplength=740, justify="left", fg="#444"
         ).pack(anchor="w", padx=10, pady=10)
 
         self.persist_preset_var = tk.StringVar(value=list(PRESETS.keys())[1])
@@ -1315,7 +733,7 @@ class TCPOptimizerApp:
         ttk.Button(btns, text="Uninstall", command=self.uninstall_persistence).pack(side="left", padx=4)
         ttk.Button(btns, text="Check status", command=self.check_persistence).pack(side="left", padx=4)
 
-        self.persist_status = tk.Label(f, text="", fg="#0a7a0a", wraplength=700, justify="left")
+        self.persist_status = tk.Label(f, text="", fg="#0a7a0a", wraplength=740, justify="left")
         self.persist_status.pack(anchor="w", padx=10, pady=10)
 
     def install_persistence(self):
@@ -1371,7 +789,8 @@ class TCPOptimizerApp:
     def uninstall_persistence(self):
         cmd = (
             f"launchctl unload -w {LAUNCH_DAEMON_PATH} 2>/dev/null; "
-            f"rm -f {LAUNCH_DAEMON_PATH} {SCRIPT_INSTALL_PATH}"
+            f"launchctl unload -w {LEGACY_LAUNCH_DAEMON_PATH} 2>/dev/null; "
+            f"rm -f {LAUNCH_DAEMON_PATH} {LEGACY_LAUNCH_DAEMON_PATH} {SCRIPT_INSTALL_PATH}"
         )
         ok, out, err = run_privileged(cmd)
         if ok:
@@ -1380,11 +799,15 @@ class TCPOptimizerApp:
             self.persist_status.config(text=f"Uninstall failed: {err or out}", fg="#a30000")
 
     def check_persistence(self):
-        exists = os.path.exists(LAUNCH_DAEMON_PATH)
-        if exists:
+        if os.path.exists(LAUNCH_DAEMON_PATH):
             ok, out, _ = run(["launchctl", "list", LAUNCH_DAEMON_LABEL])
             self.persist_status.config(
                 text=f"LaunchDaemon present at {LAUNCH_DAEMON_PATH}.\n{out}", fg="#0a7a0a"
+            )
+        elif os.path.exists(LEGACY_LAUNCH_DAEMON_PATH):
+            ok, out, _ = run(["launchctl", "list", LEGACY_LAUNCH_DAEMON_LABEL])
+            self.persist_status.config(
+                text=f"Legacy LaunchDaemon present at {LEGACY_LAUNCH_DAEMON_PATH}.\n{out}", fg="#a36a00"
             )
         else:
             self.persist_status.config(text="Not installed.", fg="#777")

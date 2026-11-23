@@ -7,16 +7,20 @@ import sys
 import unittest
 from pathlib import Path
 
-# Add project root to sys.path so we can import tcp_optimizer
+# Add project root to sys.path so we can import diagnostics directly (no Tk needed)
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
-from tcp_optimizer import (
+from diagnostics import (
     DiagnosticReport,
-    parse_wifi_output,
-    parse_networkquality_output,
-    parse_ifconfig_output,
+    clean_cli_output,
+    extract_default_gateway,
     parse_dns_output,
+    parse_ifconfig_output,
+    parse_networkquality_output,
+    parse_ping_output,
+    parse_tcp_stats_output,
+    parse_wifi_output,
 )
 
 
@@ -45,14 +49,12 @@ class TestDiagnosticParsers(unittest.TestCase):
         """
         rep = parse_wifi_output(True, sample, "", "system_profiler SPAirPortDataType")
         self.assertEqual(rep.status, "WARNING")
-        # Check findings
         findings_dict = dict(rep.findings)
         self.assertEqual(findings_dict.get("Network Name (SSID)"), "Home_Network_2G")
         self.assertEqual(findings_dict.get("Wi-Fi Standard"), "802.11n")
         self.assertIn("144 Mbps", findings_dict.get("Transmit Rate", ""))
         self.assertIn("-64 dBm", findings_dict.get("Signal Strength", ""))
 
-        # Check issues: should flag 2.4 GHz, legacy 802.11n, and low link rate
         issue_texts = " ".join(desc for _, desc in rep.issues)
         self.assertIn("2.4 GHz band", issue_texts)
         self.assertIn("802.11n", issue_texts)
@@ -81,6 +83,53 @@ class TestDiagnosticParsers(unittest.TestCase):
         self.assertEqual(findings_dict.get("Network Name (SSID)"), "FastOffice_5G")
         self.assertEqual(findings_dict.get("Wi-Fi Standard"), "802.11ax")
         self.assertIn("1200 Mbps", findings_dict.get("Transmit Rate", ""))
+
+    def test_wifi_scopes_to_current_network_and_handles_colons_and_redacted(self):
+        sample = """
+      Interfaces:
+        en0:
+          Status: Connected
+          Current Network Information:
+            My:Home:Net:
+              PHY Mode: 802.11ax
+              Channel: 149 (5GHz, 80MHz)
+              Security: WPA3 Personal
+              Signal / Noise: -55 dBm / -92 dBm
+              Transmit Rate: 960
+          Other Local Wi-Fi Networks:
+            Neighbor_2G:
+              PHY Mode: 802.11b/g/n
+              Channel: 1 (2GHz, 20MHz)
+              Signal / Noise: -88 dBm / -90 dBm
+        """
+        rep = parse_wifi_output(True, sample, "", "system_profiler SPAirPortDataType")
+        self.assertEqual(rep.status, "OK")
+        findings_dict = dict(rep.findings)
+        self.assertEqual(findings_dict.get("Network Name (SSID)"), "My:Home:Net")
+        self.assertIn("5 GHz", findings_dict.get("Channel & Band", ""))
+
+        # Verify neighbor AP does not leak when current network lacks optional fields
+        sample_redacted = """
+      Interfaces:
+        en0:
+          Status: Connected
+          Current Network Information:
+            <redacted>:
+              Channel: 36 (5GHz, 20MHz)
+              Transmit Rate: 286
+          Other Local Wi-Fi Networks:
+            Neighbor_Legacy:
+              PHY Mode: 802.11b/g/n
+              Channel: 6 (2GHz, 20MHz)
+        """
+        rep_red = parse_wifi_output(True, sample_redacted, "", "system_profiler SPAirPortDataType")
+        findings_red = dict(rep_red.findings)
+        self.assertIn("Location Services", findings_red.get("Network Name (SSID)", ""))
+        self.assertNotIn("Wi-Fi Standard", findings_red)
+        # Should warn on narrow 20MHz on 5GHz, NOT on neighbor's 2.4 GHz
+        issue_texts = " ".join(desc for _, desc in rep_red.issues)
+        self.assertIn("20 MHz channel width on 5 GHz", issue_texts)
+        self.assertNotIn("2.4 GHz", issue_texts)
 
     def test_wifi_airport_legacy_format(self):
         sample = """
@@ -128,16 +177,26 @@ channel: 6,20
     # ------------------------------------------------------------------ #
     # Network Quality Parser Tests
     # ------------------------------------------------------------------ #
-    def test_networkquality_bufferbloat_and_low_capacity(self):
-        sample = """
-==== SUMMARY ====
-Uplink capacity: 31.836 Mbps
-Downlink capacity: 4.424 Mbps
-Responsiveness: Low (679.367 milliseconds | 88 RPM)
-Idle Latency: 24.318 milliseconds | 2467 RPM
-        """
-        rep = parse_networkquality_output(True, sample, "", "networkQuality -v")
+    def test_networkquality_bufferbloat_and_low_capacity_with_sysctl_correlation(self):
+        sample = (
+            "Downlink: capacity 0.000 Mbps\rDownlink: capacity 4.424 Mbps\n"
+            "==== SUMMARY ====\n"
+            "Uplink capacity: 31.836 Mbps\n"
+            "Downlink capacity: 4.424 Mbps\n"
+            "Responsiveness: Low (679.367 milliseconds | 88 RPM)\n"
+            "Idle Latency: 24.318 milliseconds | 2467 RPM\n"
+        )
+        rep = parse_networkquality_output(
+            True,
+            sample,
+            "",
+            "networkQuality -v",
+            sysctls={"net.inet.tcp.delayed_ack": "3", "net.inet.tcp.win_scale_factor": "0"},
+        )
         self.assertEqual(rep.status, "WARNING")
+        self.assertNotIn("\r", rep.raw)
+        self.assertNotIn("0.000 Mbps", rep.raw)
+
         findings_dict = dict(rep.findings)
         self.assertEqual(findings_dict.get("Downlink Speed"), "4.42 Mbps")
         self.assertEqual(findings_dict.get("Uplink Speed"), "31.84 Mbps")
@@ -148,7 +207,18 @@ Idle Latency: 24.318 milliseconds | 2467 RPM
         issue_texts = " ".join(desc for _, desc in rep.issues)
         self.assertIn("Bufferbloat Detected", issue_texts)
         self.assertIn("Low Downlink Capacity", issue_texts)
+        self.assertIn("Window Scaling is disabled", issue_texts)
         self.assertTrue(any("Smart Queue Management" in r for r in rep.recommendations))
+        self.assertTrue(any("delayed_ack is 3" in r for r in rep.recommendations))
+
+    def test_networkquality_partial_output_on_timeout(self):
+        partial = "Downlink: capacity 42.500 Mbps, responsiveness 110 RPM - Uplink: capacity 15.200 Mbps, responsiveness 110 RPM"
+        rep = parse_networkquality_output(False, partial, "Command timed out after 60s", "networkQuality -v")
+        self.assertEqual(rep.status, "WARNING")
+        findings_dict = dict(rep.findings)
+        self.assertEqual(findings_dict.get("Downlink Speed"), "42.50 Mbps")
+        self.assertEqual(findings_dict.get("Uplink Speed"), "15.20 Mbps")
+        self.assertTrue(any("timed out before completion" in desc for _, desc in rep.issues))
 
     def test_networkquality_optimal_gigabit(self):
         sample = """
@@ -265,17 +335,24 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         self.assertIn("Self-assigned IP", issue_texts)
         self.assertIn("DHCP", issue_texts)
 
-    def test_ifconfig_substandard_mtu(self):
+    def test_ifconfig_substandard_mtu_with_sysctl_correlation(self):
         sample = """
 en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1400
 	inet 10.0.0.5 netmask 0xffffff00 broadcast 10.0.0.255
 	media: autoselect
 	status: active
         """
-        rep = parse_ifconfig_output(True, sample, "", "ifconfig")
+        rep = parse_ifconfig_output(
+            True,
+            sample,
+            "",
+            "ifconfig",
+            sysctls={"net.inet.tcp.mssdflt": "1460"},
+        )
         self.assertEqual(rep.status, "WARNING")
         issue_texts = " ".join(desc for _, desc in rep.issues)
         self.assertIn("Sub-standard MTU (1400 bytes)", issue_texts)
+        self.assertIn("mssdflt=1460 exceeds MTU-40 (1360)", issue_texts)
 
     def test_ifconfig_vpn_tunnels(self):
         sample = """
@@ -316,7 +393,7 @@ example.com.		300	IN	A	93.184.215.14
         self.assertIn("1.1.1.1", findings_dict.get("DNS Resolver", ""))
         self.assertIn("93.184.215.14", findings_dict.get("Resolved Addresses", ""))
 
-    def test_dns_dig_slow_latency(self):
+    def test_dns_dig_slow_latency_and_comparison_and_scutil(self):
         sample = """
 ;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 12345
 ;; ANSWER SECTION:
@@ -324,10 +401,33 @@ example.com.		300	IN	A	93.184.215.14
 ;; Query time: 240 msec
 ;; SERVER: 192.168.1.1#53(192.168.1.1)
         """
-        rep = parse_dns_output(True, sample, "", "dig example.com")
+        comp_sample = """
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 54321
+;; Query time: 11 msec
+;; SERVER: 1.1.1.1#53(1.1.1.1)
+        """
+        scutil_sample = """
+resolver #1
+  search domain[0] : home.arpa
+  nameserver[0] : 192.168.1.1
+        """
+        rep = parse_dns_output(
+            True,
+            sample,
+            "",
+            "dig example.com",
+            comparison_ok=True,
+            comparison_out=comp_sample,
+            scutil_out=scutil_sample,
+        )
         self.assertEqual(rep.status, "WARNING")
+        findings_dict = dict(rep.findings)
+        self.assertEqual(findings_dict.get("Cloudflare 1.1.1.1"), "11 ms (direct comparison)")
+        self.assertEqual(findings_dict.get("Configured Resolvers"), "192.168.1.1")
+        self.assertEqual(findings_dict.get("Search Domains"), "home.arpa")
         issue_texts = " ".join(desc for _, desc in rep.issues)
         self.assertIn("Slow DNS Resolution (240 ms)", issue_texts)
+        self.assertIn("significantly slower than direct 1.1.1.1", issue_texts)
         self.assertTrue(any("Cloudflare" in r or "Google" in r for r in rep.recommendations))
 
     def test_dns_dig_servfail(self):
@@ -341,7 +441,7 @@ example.com.		300	IN	A	93.184.215.14
         issue_texts = " ".join(desc for _, desc in rep.issues)
         self.assertIn("SERVFAIL", issue_texts)
 
-    def test_dns_nslookup_fallback(self):
+    def test_dns_nslookup_fallback_with_elapsed_ms(self):
         sample = """
 Server:		192.168.1.1
 Address:	192.168.1.1#53
@@ -350,16 +450,126 @@ Non-authoritative answer:
 Name:	example.com
 Address: 93.184.215.14
         """
-        rep = parse_dns_output(True, sample, "", "nslookup example.com")
+        rep = parse_dns_output(True, sample, "", "nslookup example.com", elapsed_ms=18.4)
         self.assertEqual(rep.status, "OK")
         findings_dict = dict(rep.findings)
+        self.assertIn("18 ms", findings_dict.get("Query Latency", ""))
         self.assertIn("192.168.1.1", findings_dict.get("DNS Resolver", ""))
         self.assertIn("93.184.215.14", findings_dict.get("Resolved Addresses", ""))
 
     # ------------------------------------------------------------------ #
-    # Formatter Test
+    # Gateway + Internet Ping Parser Tests
     # ------------------------------------------------------------------ #
-    def test_report_format_text_includes_sections_and_raw(self):
+    def test_extract_default_gateway_and_ping_healthy(self):
+        route_out = """
+   route to: default
+destination: default
+    gateway: 192.168.8.1
+  interface: en0
+        """
+        gw, iface = extract_default_gateway(route_out)
+        self.assertEqual(gw, "192.168.8.1")
+        self.assertEqual(iface, "en0")
+
+        gw_ping = """
+--- 192.168.8.1 ping statistics ---
+6 packets transmitted, 6 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 1.100/2.300/4.200/1.050 ms
+        """
+        inet_ping = """
+--- 1.1.1.1 ping statistics ---
+6 packets transmitted, 6 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 10.200/14.500/19.800/3.100 ms
+        """
+        rep = parse_ping_output(gw, iface, True, gw_ping, "", True, inet_ping, "")
+        self.assertEqual(rep.status, "OK")
+        self.assertEqual(len(rep.issues), 0)
+
+    def test_ping_local_vs_upstream_loss(self):
+        gw_ping_clean = """
+--- 192.168.8.1 ping statistics ---
+6 packets transmitted, 6 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 1.0/2.0/3.0/0.5 ms
+        """
+        inet_ping_loss = """
+--- 1.1.1.1 ping statistics ---
+6 packets transmitted, 4 packets received, 33.3% packet loss
+round-trip min/avg/max/stddev = 12.0/18.0/25.0/4.0 ms
+        """
+        rep_upstream = parse_ping_output("192.168.8.1", "en0", True, gw_ping_clean, "", True, inet_ping_loss, "")
+        self.assertEqual(rep_upstream.status, "WARNING")
+        self.assertIn("Upstream Packet Loss", " ".join(d for _, d in rep_upstream.issues))
+
+        gw_ping_loss = """
+--- 192.168.8.1 ping statistics ---
+6 packets transmitted, 4 packets received, 33.3% packet loss
+round-trip min/avg/max/stddev = 2.0/15.0/40.0/12.0 ms
+        """
+        rep_local = parse_ping_output("192.168.8.1", "en0", True, gw_ping_loss, "", True, inet_ping_loss, "")
+        self.assertEqual(rep_local.status, "ERROR")
+        self.assertIn("Local Packet Loss to Gateway", " ".join(d for _, d in rep_local.issues))
+
+    # ------------------------------------------------------------------ #
+    # TCP + Socket Stats Parser Tests
+    # ------------------------------------------------------------------ #
+    def test_tcp_stats_unprivileged_and_interface_errors_and_queue_backpressure(self):
+        netstat_in = """
+Name       Mtu   Network       Address            Ipkts Ierrs    Opkts Oerrs  Coll
+lo0        16384 <Link#1>                         1000     0     1000     0     0
+en0        1500  <Link#14>   0e:5f:3a:5c:4f:7f  500000     4   600000     1     2
+        """
+        netstat_s = """
+tcp:
+	0 data packet (0 byte)
+	91 open TCP sockets
+        """
+        netstat_anv = """
+Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat
+tcp4       0 131072  192.168.8.187.50000    1.1.1.1.443            ESTABLISHED         1000         2000  262144 1048576
+        """
+        rep = parse_tcp_stats_output(
+            True, netstat_in, "",
+            True, netstat_s, "",
+            True, netstat_anv, "",
+            sysctls={"net.inet.tcp.win_scale_factor": "6"},
+        )
+        self.assertEqual(rep.status, "WARNING")
+        findings_dict = dict(rep.findings)
+        self.assertEqual(findings_dict.get("Open TCP Sockets"), "91")
+        self.assertIn("Restricted", findings_dict.get("Kernel TCP Counters", ""))
+        self.assertIn("1,048,576 B", findings_dict.get("Observed Auto-Buffers", ""))
+
+        issue_texts = " ".join(d for _, d in rep.issues)
+        self.assertIn("Hardware/Link Errors on en0", issue_texts)
+        self.assertIn("Recv-Q/Send-Q", issue_texts)
+
+    def test_tcp_stats_populated_retransmissions(self):
+        netstat_in = """
+Name       Mtu   Network       Address            Ipkts Ierrs    Opkts Oerrs  Coll
+en0        1500  <Link#14>   0e:5f:3a:5c:4f:7f   10000     0    10000     0     0
+        """
+        netstat_s = """
+tcp:
+	1000 data packets (1000000 bytes)
+	50 data packets (50000 bytes) retransmitted
+	12 out-of-order packets
+	30 duplicate acks
+	15 open TCP sockets
+        """
+        rep = parse_tcp_stats_output(True, netstat_in, "", True, netstat_s, "", True, "", "")
+        self.assertEqual(rep.status, "WARNING")
+        issue_texts = " ".join(d for _, d in rep.issues)
+        self.assertIn("5.00%", issue_texts)
+
+    # ------------------------------------------------------------------ #
+    # Formatter & Clean Helper Tests
+    # ------------------------------------------------------------------ #
+    def test_clean_cli_output_resolves_carriage_returns(self):
+        raw = "step 1\rstep 2\rfinal step\nnext line"
+        self.assertEqual(clean_cli_output(raw), "final step\nnext line")
+
+    def test_report_format_text_includes_sections_and_raw_toggle(self):
         raw_cmd_output = "raw output line 1\nraw output line 2"
         rep = DiagnosticReport(
             title="Sample Test",
@@ -370,7 +580,7 @@ Address: 93.184.215.14
             recommendations=["Try fixing setting X."],
             raw=raw_cmd_output,
         )
-        formatted = rep.format_text(cmd="sample_tool -v")
+        formatted = rep.format_text(cmd="sample_tool -v", include_raw=True)
         self.assertIn("DIAGNOSTIC REPORT: SAMPLE TEST", formatted)
         self.assertIn("Status: [WARNING] Potential bottleneck detected.", formatted)
         self.assertIn("Key1                  : Val1", formatted)
@@ -378,6 +588,10 @@ Address: 93.184.215.14
         self.assertIn("→ Try fixing setting X.", formatted)
         self.assertIn("RAW CLI OUTPUT (sample_tool -v)", formatted)
         self.assertIn(raw_cmd_output, formatted)
+
+        no_raw = rep.format_text(cmd="sample_tool -v", include_raw=False)
+        self.assertNotIn("RAW CLI OUTPUT", no_raw)
+        self.assertNotIn(raw_cmd_output, no_raw)
 
 
 if __name__ == "__main__":

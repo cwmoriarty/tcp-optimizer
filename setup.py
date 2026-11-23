@@ -12,11 +12,12 @@ from setuptools import setup
 APP = ["tcp_optimizer.py"]
 OPTIONS = {
     "argv_emulation": True,
+    "includes": ["diagnostics"],
     "plist": {
         "CFBundleName": "TCP Optimizer",
         "CFBundleDisplayName": "TCP Optimizer",
-        "CFBundleIdentifier": "com.punksm4ck.tcpoptimizer",
-        "CFBundleShortVersionString": "1.0.0",
+        "CFBundleIdentifier": "com.cwmoriarty.tcpoptimizer",
+        "CFBundleShortVersionString": "1.1.0",
         "NSHumanReadableCopyright": "MIT License",
     },
 }
@@ -24,6 +25,7 @@ OPTIONS = {
 setup(
     app=APP,
     name="TCP Optimizer",
+    py_modules=["diagnostics"],
     options={"py2app": OPTIONS},
     setup_requires=["py2app"],
 )
