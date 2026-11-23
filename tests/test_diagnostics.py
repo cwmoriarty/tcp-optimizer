@@ -14,11 +14,16 @@ sys.path.insert(0, str(project_root))
 from diagnostics import (
     DiagnosticReport,
     clean_cli_output,
+    compare_benchmarks,
+    extract_benchmark_metrics,
     extract_default_gateway,
     parse_dns_output,
     parse_ifconfig_output,
+    parse_network_services,
     parse_networkquality_output,
     parse_ping_output,
+    parse_pmtud_output,
+    parse_service_order_output,
     parse_tcp_stats_output,
     parse_wifi_output,
 )
@@ -707,6 +712,81 @@ tcp4       0 131072  127.0.0.1.8080         *.*                    LISTEN       
         rep = parse_tcp_stats_output(True, netstat_in, "", True, "", "", True, netstat_anv, "")
         self.assertEqual(rep.status, "OK")
         self.assertEqual(len(rep.issues), 0)
+
+    # ------------------------------------------------------------------ #
+    # Service Order, PMTUD & Benchmark Tests
+    # ------------------------------------------------------------------ #
+    def test_service_order_detects_wifi_above_active_ethernet_and_proxies(self):
+        svc_out = """
+An asterisk (*) denotes that a network service is disabled.
+(1) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+
+(2) USB 10/100/1000 LAN
+(Hardware Port: USB 10/100/1000 LAN, Device: en8)
+
+(*) Disabled Service
+(Hardware Port: Ethernet, Device: en9)
+        """
+        services = parse_network_services(svc_out)
+        self.assertEqual(len(services), 3)
+        self.assertTrue(services[0]["enabled"])
+        self.assertFalse(services[2]["enabled"])
+
+        ifconfig_out = """
+en0: flags=8863<UP> mtu 1500
+	status: active
+en8: flags=8863<UP> mtu 1500
+	inet 192.168.1.25 netmask 0xffffff00
+	status: active
+        """
+        proxy_out = "<dictionary> {\n  HTTPEnable : 1\n  SOCKSEnable : 0\n}"
+        nc_out = '* (Connected)   1234 VPN "WorkVPN" [VPN]'
+        rep = parse_service_order_output(
+            True, svc_out, "",
+            ifconfig_out=ifconfig_out,
+            proxy_out=proxy_out,
+            nc_out=nc_out,
+        )
+        self.assertEqual(rep.status, "WARNING")
+        issue_texts = " ".join(d for _, d in rep.issues)
+        self.assertIn("Wi-Fi is prioritized ahead of active wired interface", issue_texts)
+        self.assertIn("HTTP Proxy", dict(rep.findings).get("Active System Proxies", ""))
+        self.assertIn("WorkVPN", dict(rep.findings).get("Connected VPNs", ""))
+
+    def test_pmtud_full_and_constrained(self):
+        rep_ok = parse_pmtud_output([(1472, True, "ok", "")], target="1.1.1.1")
+        self.assertEqual(rep_ok.status, "OK")
+        self.assertIn("1500 bytes", dict(rep_ok.findings).get("Discovered Path MTU", ""))
+
+        rep_low = parse_pmtud_output(
+            [(1472, False, "", "frag"), (1392, True, "ok", ""), (1420, False, "", "frag")],
+            target="1.1.1.1",
+            sysctls={"net.inet.tcp.mssdflt": "1460"},
+        )
+        self.assertEqual(rep_low.status, "WARNING")
+        self.assertIn("1420 bytes", dict(rep_low.findings).get("Discovered Path MTU", ""))
+        issue_texts = " ".join(d for _, d in rep_low.issues)
+        self.assertIn("constrained to 1420 bytes", issue_texts)
+        self.assertIn("mssdflt=1460 exceeds discovered optimal MSS (1380)", issue_texts)
+
+    def test_benchmark_extraction_and_comparison(self):
+        before = extract_benchmark_metrics(
+            nq_ok=True,
+            nq_out="Downlink capacity: 120.000 Mbps\nUplink capacity: 25.000 Mbps\nResponsiveness: Low (350.000 milliseconds | 171 RPM)\nIdle Latency: 25.000 milliseconds | 2400 RPM",
+            dns_ok=True,
+            dns_out=";; Query time: 180 msec",
+        )
+        after = extract_benchmark_metrics(
+            nq_ok=True,
+            nq_out="Downlink capacity: 320.000 Mbps\nUplink capacity: 45.000 Mbps\nResponsiveness: High (40.000 milliseconds | 1500 RPM)\nIdle Latency: 20.000 milliseconds | 3000 RPM",
+            dns_ok=True,
+            dns_out=";; Query time: 12 msec",
+        )
+        rep = compare_benchmarks(before, after)
+        self.assertEqual(rep.status, "OK")
+        self.assertIn("Measured improvement", rep.summary)
+        self.assertIn("IMPROVED", dict(rep.findings).get("DNS Latency", ""))
 
 
 if __name__ == "__main__":

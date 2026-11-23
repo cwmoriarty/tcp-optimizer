@@ -33,11 +33,16 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
 from diagnostics import (
+    compare_benchmarks,
+    extract_benchmark_metrics,
     extract_default_gateway,
     parse_dns_output,
     parse_ifconfig_output,
+    parse_network_services,
     parse_networkquality_output,
     parse_ping_output,
+    parse_pmtud_output,
+    parse_service_order_output,
     parse_tcp_stats_output,
     parse_wifi_output,
 )
@@ -79,8 +84,28 @@ TCP_KEYS = {
         "help": "0 disables delayed ACKs (lower latency, more ACK traffic); 3 is the macOS default heuristic.",
     },
     "net.inet.tcp.mssdflt": {
-        "label": "Default MSS (bytes)", "min": 536, "max": 1460, "kind": "int",
+        "label": "Default MSS (bytes)", "min": 512, "max": 1460, "kind": "int",
         "help": "Default maximum segment size used before path MTU discovery completes.",
+    },
+    "net.inet.tcp.ecn": {
+        "label": "ECN mode (0=off, 1=on)", "min": 0, "max": 2, "kind": "int",
+        "help": "Explicit Congestion Notification lets ECN-capable routers signal congestion before dropping packets.",
+    },
+    "net.inet.tcp.l4s": {
+        "label": "L4S mode (0=off, 1=on)", "min": 0, "max": 1, "kind": "int",
+        "help": "Low Latency, Low Loss, Scalable Throughput (L4S) congestion signaling on supported macOS/networks.",
+    },
+    "net.inet.tcp.accurate_ecn": {
+        "label": "Accurate ECN (0=off, 1=on)", "min": 0, "max": 1, "kind": "int",
+        "help": "Accurate ECN feedback for finer congestion reporting.",
+    },
+    "net.inet.udp.recvspace": {
+        "label": "UDP/QUIC recv buffer (bytes)", "min": 42080, "max": 8388608, "kind": "int",
+        "help": "Maximum incoming UDP datagram buffer size (affects QUIC / HTTP/3, FaceTime, WireGuard).",
+    },
+    "kern.ipc.maxsockbuf": {
+        "label": "Max socket buffer (bytes)", "min": 2097152, "max": 33554432, "kind": "int",
+        "help": "Global ceiling for TCP/UDP socket buffer auto-tuning; must be >= autorcvbufmax/autosndbufmax.",
     },
 }
 # Keys that existed on older macOS releases but return "unknown oid" on
@@ -92,20 +117,25 @@ REMOVED_UNSUPPORTED_KEYS = ["net.inet.tcp.rfc1323", "net.inet.tcp.slowstart_flig
 PRESETS = {
     "macOS Default (reset)": None,  # handled specially: reset via reboot-equivalent defaults
     "Balanced Gigabit": {
+        "kern.ipc.maxsockbuf": 8388608,
         "net.inet.tcp.sendspace": 262144,
         "net.inet.tcp.recvspace": 262144,
         "net.inet.tcp.autorcvbufmax": 4194304,
         "net.inet.tcp.autosndbufmax": 4194304,
         "net.inet.tcp.win_scale_factor": 6,
         "net.inet.tcp.delayed_ack": 3,
+        "net.inet.tcp.ecn": 1,
     },
     "High-Throughput / Large Downloads": {
+        "kern.ipc.maxsockbuf": 16777216,
         "net.inet.tcp.sendspace": 524288,
         "net.inet.tcp.recvspace": 524288,
         "net.inet.tcp.autorcvbufmax": 8388608,
         "net.inet.tcp.autosndbufmax": 8388608,
+        "net.inet.udp.recvspace": 2097152,
         "net.inet.tcp.win_scale_factor": 8,
         "net.inet.tcp.delayed_ack": 3,
+        "net.inet.tcp.ecn": 1,
     },
     "Low-Latency / Gaming": {
         "net.inet.tcp.sendspace": 131072,
@@ -114,6 +144,9 @@ PRESETS = {
         "net.inet.tcp.autosndbufmax": 2097152,
         "net.inet.tcp.win_scale_factor": 4,
         "net.inet.tcp.delayed_ack": 0,
+        "net.inet.tcp.ecn": 1,
+        "net.inet.tcp.l4s": 1,
+        "net.inet.tcp.accurate_ecn": 1,
     },
 }
 
@@ -121,13 +154,18 @@ PRESETS = {
 # out-of-the-box values on recent macOS releases; harmless if slightly off
 # since they only matter until next reboot anyway.
 MACOS_DEFAULTS = {
+    "kern.ipc.maxsockbuf": 8388608,
     "net.inet.tcp.sendspace": 131072,
     "net.inet.tcp.recvspace": 131072,
     "net.inet.tcp.autorcvbufmax": 2097152,
     "net.inet.tcp.autosndbufmax": 2097152,
+    "net.inet.udp.recvspace": 786896,
     "net.inet.tcp.win_scale_factor": 3,
     "net.inet.tcp.delayed_ack": 3,
-    "net.inet.tcp.mssdflt": 1460,
+    "net.inet.tcp.mssdflt": 512,
+    "net.inet.tcp.ecn": 1,
+    "net.inet.tcp.l4s": 0,
+    "net.inet.tcp.accurate_ecn": 0,
 }
 
 
@@ -210,6 +248,8 @@ class TCPOptimizerApp:
         self._diag_queue = queue.Queue()
         self._diag_running = False
         self._diag_buttons = []
+        self._baseline_benchmark = None
+        self._services_cache = []
 
         if not is_macos():
             messagebox.showwarning(
@@ -226,18 +266,21 @@ class TCPOptimizerApp:
         self.tab_optimize = ttk.Frame(nb)
         self.tab_advanced = ttk.Frame(nb)
         self.tab_diag = ttk.Frame(nb)
+        self.tab_fixes = ttk.Frame(nb)
         self.tab_persist = ttk.Frame(nb)
 
         nb.add(self.tab_overview, text="Overview")
         nb.add(self.tab_optimize, text="Presets")
         nb.add(self.tab_advanced, text="Advanced")
         nb.add(self.tab_diag, text="Diagnostics")
+        nb.add(self.tab_fixes, text="Quick Fixes")
         nb.add(self.tab_persist, text="Persistence")
 
         self._build_overview()
         self._build_optimize()
         self._build_advanced()
         self._build_diagnostics()
+        self._build_quick_fixes()
         self._build_persistence()
 
     # ------------------------------------------------------------------ #
@@ -379,6 +422,14 @@ class TCPOptimizerApp:
             self.advanced_status.config(text="Nothing to apply.", fg="#777")
             return
 
+        # Apply kern.ipc.maxsockbuf first so larger buffer ceilings succeed.
+        if "kern.ipc.maxsockbuf" in to_apply:
+            ordered = {"kern.ipc.maxsockbuf": to_apply["kern.ipc.maxsockbuf"]}
+            for k, v in to_apply.items():
+                if k != "kern.ipc.maxsockbuf":
+                    ordered[k] = v
+            to_apply = ordered
+
         all_ok, applied, failed, raw = apply_sysctl_values(to_apply)
         if all_ok:
             self.advanced_status.config(text=f"Applied: {', '.join(applied)}", fg="#0a7a0a")
@@ -405,37 +456,53 @@ class TCPOptimizerApp:
 
         btns_row1 = ttk.Frame(f)
         btns_row1.pack(fill="x", padx=10, pady=(2, 2))
-        btn_specs = [
+        btn_specs_r1 = [
             ("Wi-Fi link info", self.diag_wifi),
             ("Network Quality Test", self.diag_networkquality),
             ("Interface + MTU", self.diag_ifconfig),
             ("DNS latency", self.diag_dns),
             ("Gateway + Ping", self.diag_ping),
-            ("TCP + Socket Stats", self.diag_tcp_stats),
         ]
-        for label, cmd_fn in btn_specs:
+        for label, cmd_fn in btn_specs_r1:
             b = ttk.Button(btns_row1, text=label, command=cmd_fn)
             b.pack(side="left", padx=3)
             self._diag_buttons.append(b)
 
         btns_row2 = ttk.Frame(f)
-        btns_row2.pack(fill="x", padx=10, pady=(2, 4))
-        b_all = ttk.Button(btns_row2, text="Run All Checks", command=self.diag_all)
-        b_all.pack(side="left", padx=3)
-        self._diag_buttons.append(b_all)
+        btns_row2.pack(fill="x", padx=10, pady=(2, 2))
+        btn_specs_r2 = [
+            ("TCP + Socket Stats", self.diag_tcp_stats),
+            ("Path MTU Discovery", self.diag_pmtud),
+            ("Service Order + Proxies", self.diag_services),
+            ("Run All Checks", self.diag_all),
+        ]
+        for label, cmd_fn in btn_specs_r2:
+            b = ttk.Button(btns_row2, text=label, command=cmd_fn)
+            b.pack(side="left", padx=3)
+            self._diag_buttons.append(b)
+
+        btns_row3 = ttk.Frame(f)
+        btns_row3.pack(fill="x", padx=10, pady=(2, 4))
+        b_base = ttk.Button(btns_row3, text="Save Baseline Benchmark", command=self.diag_save_baseline)
+        b_base.pack(side="left", padx=3)
+        self._diag_buttons.append(b_base)
+
+        b_cmp = ttk.Button(btns_row3, text="Compare to Baseline", command=self.diag_compare_baseline)
+        b_cmp.pack(side="left", padx=3)
+        self._diag_buttons.append(b_cmp)
 
         self.show_raw_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            btns_row2,
+            btns_row3,
             text="Show raw CLI output",
             variable=self.show_raw_var,
             command=self._rerender_diag_history,
         ).pack(side="left", padx=10)
 
-        self.diag_status_lbl = tk.Label(btns_row2, text="", fg="#0055aa")
-        self.diag_status_lbl.pack(side="left", padx=8)
+        self.diag_status_lbl = tk.Label(btns_row3, text="", fg="#0055aa")
+        self.diag_status_lbl.pack(side="left", padx=6)
 
-        b_clear = ttk.Button(btns_row2, text="Clear", command=self.diag_clear)
+        b_clear = ttk.Button(btns_row3, text="Clear", command=self.diag_clear)
         b_clear.pack(side="right", padx=3)
         self._diag_buttons.append(b_clear)
 
@@ -671,6 +738,70 @@ class TCPOptimizerApp:
         )
         return report, "netstat -in ; netstat -s -p tcp ; netstat -anv -p tcp"
 
+    def _collect_pmtud(self):
+        target = "1.1.1.1"
+        probes = []
+        # Fast path: test standard 1500 MTU (1472 payload + 28 IP/ICMP header)
+        ok, out, err = run(["ping", "-D", "-c", "1", "-W", "1500", "-s", "1472", target], timeout=5)
+        probes.append((1472, ok, out, err))
+        if not ok:
+            # Binary search between 548 (MTU 576) and 1471
+            lo, hi = 548, 1471
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                p_ok, p_out, p_err = run(
+                    ["ping", "-D", "-c", "1", "-W", "1200", "-s", str(mid), target],
+                    timeout=5,
+                )
+                probes.append((mid, p_ok, p_out, p_err))
+                if p_ok:
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+        sysctls = read_all_tcp_sysctls()
+        report = parse_pmtud_output(probes, target=target, sysctls=sysctls)
+        return report, f"ping -D -c 1 -s <size> {target}"
+
+    def _collect_services(self):
+        ok, out, err = run(["networksetup", "-listnetworkserviceorder"], timeout=10)
+        _, if_out, _ = run(["ifconfig"], timeout=10)
+        _, proxy_out, _ = run(["scutil", "--proxy"], timeout=5)
+        _, nc_out, _ = run(["scutil", "--nc", "list"], timeout=5)
+        report = parse_service_order_output(
+            ok, out, err,
+            ifconfig_out=if_out,
+            proxy_out=proxy_out,
+            nc_out=nc_out,
+        )
+        return report, "networksetup -listnetworkserviceorder ; scutil --proxy ; scutil --nc list"
+
+    def _collect_benchmark_suite(self):
+        """Run DNS, gateway/internet ping, and networkQuality to capture benchmark metrics."""
+        t0 = time.monotonic()
+        dns_ok, dns_out, _ = run(["dig", "+tries=1", "+time=3", "example.com"], timeout=8)
+        dns_ms = (time.monotonic() - t0) * 1000.0
+
+        route_ok, route_out, _ = run(["route", "-n", "get", "default"], timeout=5)
+        gw_ip, _ = extract_default_gateway(route_out) if route_ok else (None, None)
+        gw_ok, gw_out = False, ""
+        if gw_ip:
+            ping_bin = "ping6" if ":" in gw_ip else "ping"
+            gw_ok, gw_out, _ = run([ping_bin, "-c", "6", "-i", "0.2", gw_ip], timeout=10)
+        inet_ok, inet_out, _ = run(["ping", "-c", "6", "-i", "0.2", "1.1.1.1"], timeout=10)
+
+        nq_ok, nq_out, _ = run(["networkQuality", "-v"], timeout=60)
+        return extract_benchmark_metrics(
+            nq_ok=nq_ok,
+            nq_out=nq_out,
+            gw_ping_ok=gw_ok,
+            gw_ping_out=gw_out,
+            inet_ping_ok=inet_ok,
+            inet_ping_out=inet_out,
+            dns_ok=dns_ok,
+            dns_out=dns_out,
+            dns_elapsed_ms=dns_ms,
+        )
+
     # --- UI Diagnostic Button Handlers ---
     def diag_wifi(self):
         self._run_diag_async("Checking Wi-Fi link...", lambda emit, _: emit(*self._collect_wifi()))
@@ -693,15 +824,58 @@ class TCPOptimizerApp:
     def diag_tcp_stats(self):
         self._run_diag_async("Collecting TCP & interface counters...", lambda emit, _: emit(*self._collect_tcp_stats()))
 
+    def diag_pmtud(self):
+        self._run_diag_async("Running Path MTU Discovery...", lambda emit, _: emit(*self._collect_pmtud()))
+
+    def diag_services(self):
+        self._run_diag_async("Checking service order & proxies...", lambda emit, _: emit(*self._collect_services()))
+
+    def diag_save_baseline(self):
+        def worker(emit, update_status):
+            from diagnostics import DiagnosticReport
+            update_status("Measuring baseline (ping, DNS, networkQuality)...")
+            metrics = self._collect_benchmark_suite()
+            self._baseline_benchmark = metrics
+            findings = [(k, f"{v:.2f}") for k, v in metrics.items()]
+            rep = DiagnosticReport(
+                title="Baseline Benchmark Saved",
+                status="OK" if metrics else "WARNING",
+                summary="Baseline saved. Apply fixes/presets, then click 'Compare to Baseline'." if metrics else "No benchmark metrics captured.",
+                findings=findings,
+                raw=str(metrics),
+            )
+            emit(rep, "baseline snapshot")
+
+        self._run_diag_async("Saving baseline benchmark...", worker)
+
+    def diag_compare_baseline(self):
+        if not self._baseline_benchmark:
+            messagebox.showinfo(
+                APP_NAME,
+                "Save a baseline benchmark first using 'Save Baseline Benchmark', then apply your changes and compare.",
+            )
+            return
+        baseline = dict(self._baseline_benchmark)
+
+        def worker(emit, update_status):
+            update_status("Measuring post-change metrics (ping, DNS, networkQuality)...")
+            after = self._collect_benchmark_suite()
+            rep = compare_benchmarks(baseline, after)
+            emit(rep, "before/after comparison")
+
+        self._run_diag_async("Comparing against baseline...", worker)
+
     def diag_all(self):
         def worker(emit, update_status):
             steps = [
-                ("1/6 Checking Wi-Fi link...", self._collect_wifi),
-                ("2/6 Checking interfaces + MTU...", self._collect_ifconfig),
-                ("3/6 Checking DNS latency...", self._collect_dns),
-                ("4/6 Pinging gateway & 1.1.1.1...", self._collect_ping),
-                ("5/6 Collecting TCP & socket stats...", self._collect_tcp_stats),
-                ("6/6 Running networkQuality (~20-30s)...", self._collect_networkquality),
+                ("1/8 Checking Wi-Fi link...", self._collect_wifi),
+                ("2/8 Checking interfaces + MTU...", self._collect_ifconfig),
+                ("3/8 Checking service order & proxies...", self._collect_services),
+                ("4/8 Checking DNS latency...", self._collect_dns),
+                ("5/8 Pinging gateway & 1.1.1.1...", self._collect_ping),
+                ("6/8 Running Path MTU Discovery...", self._collect_pmtud),
+                ("7/8 Collecting TCP & socket stats...", self._collect_tcp_stats),
+                ("8/8 Running networkQuality (~20-30s)...", self._collect_networkquality),
             ]
             for label, fn in steps:
                 update_status(label)
@@ -716,6 +890,234 @@ class TCPOptimizerApp:
         self.diag_text.config(state="normal")
         self.diag_text.delete("1.0", tk.END)
         self.diag_text.config(state="disabled")
+
+    # ------------------------------------------------------------------ #
+    # Quick Fixes (macOS-side DNS, MTU, DHCP, Service Order)
+    # ------------------------------------------------------------------ #
+    def _build_quick_fixes(self):
+        f = self.tab_fixes
+        tk.Label(
+            f, text="Apply real macOS-level network fixes for issues found in Diagnostics "
+                    "(DNS resolvers, DNS cache flush, MTU alignment, DHCP renewal, and "
+                    "Ethernet vs. Wi-Fi service priority). Admin actions prompt via macOS.",
+            wraplength=740, justify="left", fg="#444"
+        ).pack(anchor="w", padx=10, pady=(10, 6))
+
+        svc_row = ttk.Frame(f)
+        svc_row.pack(fill="x", padx=10, pady=4)
+        tk.Label(svc_row, text="Target network service:").pack(side="left")
+        self.fix_service_var = tk.StringVar(value="")
+        self.fix_service_menu = ttk.OptionMenu(svc_row, self.fix_service_var, "")
+        self.fix_service_menu.pack(side="left", padx=6)
+        ttk.Button(svc_row, text="Refresh", command=self.refresh_services).pack(side="left", padx=4)
+
+        self.fix_info_lbl = tk.Label(f, text="", justify="left", fg="#333", font=("Menlo", 10))
+        self.fix_info_lbl.pack(anchor="w", padx=10, pady=(2, 8))
+
+        # 1. DNS Section
+        dns_box = ttk.LabelFrame(f, text="1. Fast DNS Resolvers & Cache")
+        dns_box.pack(fill="x", padx=10, pady=4)
+        dns_btns = ttk.Frame(dns_box)
+        dns_btns.pack(fill="x", padx=8, pady=6)
+        ttk.Button(
+            dns_btns, text="Cloudflare (1.1.1.1)",
+            command=lambda: self.fix_set_dns(["1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001"]),
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            dns_btns, text="Google (8.8.8.8)",
+            command=lambda: self.fix_set_dns(["8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844"]),
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            dns_btns, text="Quad9 (9.9.9.9)",
+            command=lambda: self.fix_set_dns(["9.9.9.9", "149.112.112.112"]),
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            dns_btns, text="Reset to DHCP (Auto)",
+            command=lambda: self.fix_set_dns(["Empty"]),
+        ).pack(side="left", padx=3)
+        ttk.Button(dns_btns, text="Flush DNS Cache", command=self.fix_flush_dns).pack(side="right", padx=3)
+
+        # 2. MTU & DHCP Section
+        mtu_box = ttk.LabelFrame(f, text="2. Interface MTU & DHCP Lease Recovery")
+        mtu_box.pack(fill="x", padx=10, pady=4)
+        mtu_row = ttk.Frame(mtu_box)
+        mtu_row.pack(fill="x", padx=8, pady=6)
+        ttk.Button(mtu_row, text="Set MTU 1500 (Default)", command=lambda: self.fix_set_mtu(1500)).pack(side="left", padx=3)
+        ttk.Button(mtu_row, text="Set MTU 1420 (VPN-safe)", command=lambda: self.fix_set_mtu(1420)).pack(side="left", padx=3)
+        tk.Label(mtu_row, text="Custom:").pack(side="left", padx=(10, 2))
+        self.fix_custom_mtu_var = tk.StringVar(value="1500")
+        ttk.Entry(mtu_row, textvariable=self.fix_custom_mtu_var, width=6).pack(side="left", padx=2)
+        ttk.Button(mtu_row, text="Apply MTU", command=self.fix_apply_custom_mtu).pack(side="left", padx=3)
+
+        self.sync_mss_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            mtu_box,
+            text="Also sync sysctl net.inet.tcp.mssdflt = MTU - 40 when changing MTU",
+            variable=self.sync_mss_var,
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+
+        dhcp_row = ttk.Frame(mtu_box)
+        dhcp_row.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Button(dhcp_row, text="Renew DHCP Lease (fixes 169.254.x.x)", command=self.fix_renew_dhcp).pack(side="left", padx=3)
+
+        # 3. Routing Priority Section
+        prio_box = ttk.LabelFrame(f, text="3. Network Service Routing Priority")
+        prio_box.pack(fill="x", padx=10, pady=4)
+        prio_row = ttk.Frame(prio_box)
+        prio_row.pack(fill="x", padx=8, pady=6)
+        ttk.Button(
+            prio_row, text="Prioritize Wired Ethernet Over Wi-Fi",
+            command=self.fix_prioritize_ethernet,
+        ).pack(side="left", padx=3)
+
+        self.fix_status_lbl = tk.Label(f, text="", fg="#0a7a0a", wraplength=740, justify="left")
+        self.fix_status_lbl.pack(anchor="w", padx=10, pady=8)
+
+        self.refresh_services()
+
+    def _selected_service_info(self):
+        name = self.fix_service_var.get()
+        for svc in self._services_cache:
+            if svc["name"] == name:
+                return svc
+        return None
+
+    def refresh_services(self):
+        ok, out, _ = run(["networksetup", "-listnetworkserviceorder"], timeout=10)
+        services = [s for s in parse_network_services(out) if s["enabled"]] if ok else []
+        self._services_cache = services
+
+        menu = self.fix_service_menu["menu"]
+        menu.delete(0, "end")
+        names = [s["name"] for s in services]
+        for n in names:
+            menu.add_command(
+                label=n,
+                command=lambda val=n: (self.fix_service_var.set(val), self._update_selected_service_info()),
+            )
+        if names:
+            if self.fix_service_var.get() not in names:
+                self.fix_service_var.set(names[0])
+            self._update_selected_service_info()
+        else:
+            self.fix_service_var.set("")
+            self.fix_info_lbl.config(text="No enabled macOS network services detected.")
+
+    def _update_selected_service_info(self):
+        svc = self._selected_service_info()
+        if not svc:
+            self.fix_info_lbl.config(text="")
+            return
+        name = svc["name"]
+        dev = svc["device"] or "virtual"
+        _, dns_out, _ = run(["networksetup", "-getdnsservers", name], timeout=5)
+        dns_disp = ", ".join(dns_out.splitlines()) if dns_out else "unknown"
+        _, mtu_out, _ = run(["networksetup", "-getMTU", name], timeout=5)
+        mtu_disp = mtu_out.strip() if mtu_out else "unknown"
+        self.fix_info_lbl.config(
+            text=f"Device: {dev}  |  DNS: {dns_disp}\n{mtu_disp}"
+        )
+
+    def fix_set_dns(self, servers):
+        svc = self._selected_service_info()
+        if not svc:
+            self.fix_status_lbl.config(text="No target network service selected.", fg="#a30000")
+            return
+        args = " ".join(shlex.quote(s) for s in servers)
+        cmd = (
+            f"networksetup -setdnsservers {shlex.quote(svc['name'])} {args} && "
+            "dscacheutil -flushcache && killall -HUP mDNSResponder"
+        )
+        ok, out, err = run_privileged(cmd)
+        if ok:
+            label = "DHCP automatic" if servers == ["Empty"] else ", ".join(servers[:2])
+            self.fix_status_lbl.config(text=f"Updated DNS on '{svc['name']}' to {label} and flushed cache.", fg="#0a7a0a")
+            self._update_selected_service_info()
+        else:
+            self.fix_status_lbl.config(text=f"Failed to update DNS: {err or out}", fg="#a30000")
+
+    def fix_flush_dns(self):
+        ok, out, err = run_privileged("dscacheutil -flushcache && killall -HUP mDNSResponder")
+        if ok:
+            self.fix_status_lbl.config(text="Flushed macOS DNS cache.", fg="#0a7a0a")
+        else:
+            self.fix_status_lbl.config(text=f"Failed to flush DNS cache: {err or out}", fg="#a30000")
+
+    def fix_apply_custom_mtu(self):
+        raw = self.fix_custom_mtu_var.get().strip()
+        try:
+            mtu = int(raw)
+        except ValueError:
+            messagebox.showerror(APP_NAME, f"'{raw}' is not a valid integer MTU.")
+            return
+        if not (576 <= mtu <= 9000):
+            messagebox.showerror(APP_NAME, f"MTU {mtu} is outside the safe range 576\u20139000.")
+            return
+        self.fix_set_mtu(mtu)
+
+    def fix_set_mtu(self, mtu):
+        svc = self._selected_service_info()
+        if not svc:
+            self.fix_status_lbl.config(text="No target network service selected.", fg="#a30000")
+            return
+        cmds = [f"networksetup -setMTU {shlex.quote(svc['name'])} {mtu}"]
+        if self.sync_mss_var.get():
+            mss = max(512, min(1460, mtu - 40))
+            cmds.append(f"(sysctl -w net.inet.tcp.mssdflt={mss} >/dev/null 2>&1 || true)")
+        ok, out, err = run_privileged(" && ".join(cmds))
+        if ok:
+            mss_msg = f" (and net.inet.tcp.mssdflt={max(512, min(1460, mtu - 40))})" if self.sync_mss_var.get() else ""
+            self.fix_status_lbl.config(text=f"Set MTU on '{svc['name']}' to {mtu}{mss_msg}.", fg="#0a7a0a")
+            self._update_selected_service_info()
+            self.refresh_overview()
+            self.reload_advanced()
+        else:
+            self.fix_status_lbl.config(text=f"Failed to set MTU (service may not support manual MTU): {err or out}", fg="#a30000")
+
+    def fix_renew_dhcp(self):
+        svc = self._selected_service_info()
+        if not svc or not svc["device"]:
+            self.fix_status_lbl.config(text="Select a physical network service (with a device like en0) first.", fg="#a30000")
+            return
+        cmd = f"ipconfig set {shlex.quote(svc['device'])} DHCP"
+        ok, out, err = run_privileged(cmd)
+        if ok:
+            self.fix_status_lbl.config(text=f"Triggered DHCP lease renewal on {svc['device']} ({svc['name']}).", fg="#0a7a0a")
+            self._update_selected_service_info()
+        else:
+            self.fix_status_lbl.config(text=f"Failed to renew DHCP: {err or out}", fg="#a30000")
+
+    def fix_prioritize_ethernet(self):
+        self.refresh_services()
+        enabled = [s for s in self._services_cache if s["enabled"]]
+        if not enabled:
+            self.fix_status_lbl.config(text="No enabled network services found.", fg="#a30000")
+            return
+        wired = []
+        others = []
+        for s in enabled:
+            dev = s["device"]
+            nl = (s["name"] + " " + s["port"]).lower()
+            is_wifi = "wi-fi" in nl or "airport" in nl
+            is_wired = dev.startswith("en") and not is_wifi and "thunderbolt bridge" not in nl and "iphone usb" not in nl
+            if is_wired:
+                wired.append(s["name"])
+            else:
+                others.append(s["name"])
+        if not wired:
+            self.fix_status_lbl.config(text="No wired Ethernet / USB-C LAN interface found to prioritize.", fg="#a36a00")
+            return
+        new_order = wired + others
+        if new_order == [s["name"] for s in enabled]:
+            self.fix_status_lbl.config(text="Wired Ethernet is already prioritized ahead of Wi-Fi.", fg="#0a7a0a")
+            return
+        args = " ".join(shlex.quote(n) for n in new_order)
+        ok, out, err = run_privileged(f"networksetup -ordernetworkservices {args}")
+        if ok:
+            self.fix_status_lbl.config(text=f"Updated service order: {' > '.join(new_order[:4])}", fg="#0a7a0a")
+            self.refresh_services()
+        else:
+            self.fix_status_lbl.config(text=f"Failed to reorder services: {err or out}", fg="#a30000")
 
     # ------------------------------------------------------------------ #
     # Persistence (LaunchDaemon so presets survive reboot)

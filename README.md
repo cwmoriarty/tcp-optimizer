@@ -33,14 +33,21 @@ that's almost always worth checking before touching TCP buffers.
 - **Diagnostics** — Runs non-blocking background checks for Wi-Fi link info
   (`airport` / `system_profiler`), `networkQuality`, `ifconfig`/MTU, DNS lookup
   timing & resolver comparison (`dig` / `nslookup` / `scutil --dns`),
-  Gateway + Internet ping (`route` / `ping`), and TCP + interface counters
-  (`netstat`). Each check parses raw CLI output in `diagnostics.py` into a
-  high-level report flagging misconfigurations, hardware bottlenecks (e.g.
+  Gateway + Internet ping (`route` / `ping`), Path MTU Discovery (`ping -D`),
+  Service Order + Proxies (`networksetup` / `scutil`), and TCP + interface
+  counters (`netstat`). Each check parses raw CLI output in `diagnostics.py` into
+  a high-level report flagging misconfigurations, hardware bottlenecks (e.g.
   2.4 GHz band, narrow 20 MHz 5 GHz channels, 100baseTX Ethernet negotiation
-  caps, bufferbloat, local vs. upstream packet loss, DHCP failure), and
-  cross-correlated `sysctl` recommendations before displaying the raw tool
-  output. Includes **Run All Checks**, a **Show raw CLI output** toggle, and
-  **Clear** controls.
+  caps, bufferbloat, local vs. upstream packet loss, DHCP failure, Wi-Fi
+  prioritized over Ethernet), and cross-correlated `sysctl` recommendations
+  before displaying the raw tool output. Includes **Run All Checks**,
+  **Save Baseline Benchmark** / **Compare to Baseline**, a **Show raw CLI
+  output** toggle, and **Clear** controls.
+- **Quick Fixes** — One-click macOS network remediation for issues found in
+  Diagnostics: switch DNS resolvers (Cloudflare `1.1.1.1`, Google `8.8.8.8`,
+  Quad9 `9.9.9.9`, or reset to DHCP) with cache flush, adjust interface MTU
+  (with optional `net.inet.tcp.mssdflt` sync), renew DHCP leases, and
+  prioritize wired Ethernet over Wi-Fi.
 - **Persistence** — `sysctl -w` changes reset on every reboot. This tab can
   install a small root-owned LaunchDaemon (`com.cwmoriarty.tcpoptimizer`)
   that re-applies your chosen preset at boot, and an uninstall button to

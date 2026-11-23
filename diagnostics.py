@@ -1396,3 +1396,390 @@ def parse_tcp_stats_output(
         recommendations=recommendations,
         raw=raw,
     )
+
+
+def parse_network_services(out):
+    """
+    Parse `networksetup -listnetworkserviceorder` into ordered list of dicts:
+    [{"order": int, "name": str, "enabled": bool, "port": str, "device": str}, ...]
+    """
+    services = []
+    current = None
+    for line in (out or "").splitlines():
+        s = line.strip()
+        m_svc = re.match(r"^\((\d+|\*)\)\s+(.+)$", s)
+        if m_svc:
+            if current:
+                services.append(current)
+            order_tok = m_svc.group(1)
+            current = {
+                "order": None if order_tok == "*" else int(order_tok),
+                "name": m_svc.group(2).strip(),
+                "enabled": order_tok != "*",
+                "port": "",
+                "device": "",
+            }
+            continue
+        m_hw = re.match(r"^\(Hardware Port:\s*(.+?),\s*Device:\s*(.*?)\)$", s)
+        if m_hw and current is not None:
+            current["port"] = m_hw.group(1).strip()
+            current["device"] = m_hw.group(2).strip()
+    if current:
+        services.append(current)
+    return services
+
+
+def _active_devices_from_ifconfig(ifconfig_out):
+    """Return set of device names (e.g. {'en0', 'en8'}) with status: active or IPv4."""
+    active = set()
+    curr = None
+    for line in (ifconfig_out or "").splitlines():
+        m = re.match(r"^([a-zA-Z0-9]+):\s*flags=", line)
+        if m:
+            curr = m.group(1)
+        elif curr:
+            s = line.strip()
+            if s == "status: active" or s.startswith("inet "):
+                active.add(curr)
+    return active
+
+
+def parse_service_order_output(
+    ok,
+    out,
+    err,
+    ifconfig_out="",
+    proxy_out="",
+    nc_out="",
+):
+    """
+    Parse network service priority (`networksetup -listnetworkserviceorder`),
+    HTTP/SOCKS proxies (`scutil --proxy`), and VPN service state (`scutil --nc list`).
+    """
+    raw_parts = [f"--- Network Service Order ---\n{(out if ok else (err or out)).strip()}"]
+    if proxy_out:
+        raw_parts.append(f"--- System Proxies (scutil --proxy) ---\n{proxy_out.strip()}")
+    if nc_out:
+        raw_parts.append(f"--- Network Connections (scutil --nc list) ---\n{nc_out.strip()}")
+    raw = "\n\n".join(raw_parts)
+
+    if not ok:
+        return DiagnosticReport(
+            title="Service Order + Proxies",
+            status="ERROR",
+            summary="Failed to inspect network service order.",
+            issues=[("ERROR", err or out or "networksetup failed")],
+            raw=raw,
+        )
+
+    services = parse_network_services(out)
+    active_devs = _active_devices_from_ifconfig(ifconfig_out)
+    findings = []
+    issues = []
+    recommendations = []
+
+    enabled_svcs = [s for s in services if s["enabled"]]
+    if enabled_svcs:
+        order_items = []
+        for s in enabled_svcs[:6]:
+            dev = s["device"]
+            order_items.append(f"{s['name']} ({dev})" if dev else s["name"])
+        findings.append(("Service Priority", " > ".join(order_items)))
+
+    # Detect Wi-Fi prioritized above an active wired Ethernet/USB/Thunderbolt NIC
+    wifi_idx = None
+    active_wired = []
+    for idx, s in enumerate(enabled_svcs):
+        dev = s["device"]
+        name_l = (s["name"] + " " + s["port"]).lower()
+        is_wifi = "wi-fi" in name_l or "airport" in name_l
+        is_wired = (
+            dev.startswith("en")
+            and not is_wifi
+            and "thunderbolt bridge" not in name_l
+            and "iphone usb" not in name_l
+        )
+        if is_wifi and wifi_idx is None:
+            wifi_idx = idx
+        elif is_wired and (dev in active_devs):
+            active_wired.append((idx, s))
+
+    if wifi_idx is not None:
+        for eth_idx, eth_svc in active_wired:
+            if wifi_idx < eth_idx:
+                issues.append((
+                    "WARNING",
+                    f"Wi-Fi is prioritized ahead of active wired interface '{eth_svc['name']}' ({eth_svc['device']}). "
+                    "macOS routes traffic through the first active service in the list, so you may still be using slower Wi-Fi while plugged into Ethernet."
+                ))
+                recommendations.append(
+                    "Click 'Prioritize Ethernet Over Wi-Fi' on the Quick Fixes tab (or reorder services in System Settings > Network)."
+                )
+
+    # Parse scutil --proxy for active throttling/filtering proxies
+    if proxy_out:
+        active_proxies = []
+        for pkey, plabel in [
+            ("HTTPEnable", "HTTP Proxy"),
+            ("HTTPSEnable", "HTTPS Proxy"),
+            ("SOCKSEnable", "SOCKS Proxy"),
+            ("ProxyAutoConfigEnable", "PAC Auto-Config"),
+        ]:
+            if re.search(rf"{pkey}\s*:\s*1\b", proxy_out):
+                active_proxies.append(plabel)
+        if active_proxies:
+            findings.append(("Active System Proxies", ", ".join(active_proxies)))
+            issues.append((
+                "INFO",
+                f"Active system proxy configured ({', '.join(active_proxies)}). Proxies intercept traffic and can throttle speed or increase latency."
+            ))
+        else:
+            findings.append(("System Proxies", "None enabled"))
+
+    # Parse scutil --nc list for active VPNs
+    if nc_out:
+        connected_vpns = []
+        for line in nc_out.splitlines():
+            if "(Connected)" in line:
+                m_q = re.search(r'"([^"]+)"', line)
+                connected_vpns.append(m_q.group(1) if m_q else line.strip())
+        if connected_vpns:
+            findings.append(("Connected VPNs", ", ".join(connected_vpns)))
+
+    report_status = _derive_status(issues)
+    if report_status == "OK":
+        summary = "Network service priority and proxy configuration look clean."
+    else:
+        summary = "Service routing priority issue detected (Wi-Fi ahead of active Ethernet)."
+
+    return DiagnosticReport(
+        title="Service Order + Proxies",
+        status=report_status,
+        summary=summary,
+        findings=findings,
+        issues=issues,
+        recommendations=recommendations,
+        raw=raw,
+    )
+
+
+def parse_pmtud_output(probes, target="1.1.1.1", sysctls=None, interface_mtu=None):
+    """
+    Parse Don't Fragment (`ping -D -s <payload>`) probes into true Path MTU.
+    `probes` is a list of (payload_bytes, ok, out, err).
+    """
+    raw_lines = []
+    passed_payloads = []
+    for payload, ok, out, err in probes:
+        mtu_equiv = payload + 28
+        raw_lines.append(f"payload={payload} (MTU={mtu_equiv}): {'OK' if ok else 'FAIL'}  {err or ''}".strip())
+        if ok:
+            passed_payloads.append(payload)
+    raw = "\n".join(raw_lines)
+
+    if not passed_payloads:
+        return DiagnosticReport(
+            title="Path MTU Discovery",
+            status="ERROR",
+            summary=f"All Don't-Fragment ICMP probes to {target} failed.",
+            issues=[("ERROR", f"Unable to determine Path MTU to {target} (ICMP blocked or no connectivity).")],
+            recommendations=["Verify internet connectivity or check if ICMP is blocked by a firewall."],
+            raw=raw,
+        )
+
+    max_payload = max(passed_payloads)
+    path_mtu = max_payload + 28
+    findings = [
+        ("Target Host", target),
+        ("Max Unfragmented Payload", f"{max_payload} bytes (ICMP/IP overhead: 28 B)"),
+        ("Discovered Path MTU", f"{path_mtu} bytes (Optimal TCP MSS: {path_mtu - 40} bytes)"),
+    ]
+    if interface_mtu is not None:
+        findings.append(("Configured Interface MTU", f"{interface_mtu} bytes"))
+
+    issues = []
+    recommendations = []
+
+    mssdflt_val = None
+    if sysctls and sysctls.get("net.inet.tcp.mssdflt"):
+        try:
+            mssdflt_val = int(sysctls["net.inet.tcp.mssdflt"])
+        except ValueError:
+            pass
+
+    if path_mtu < 1500:
+        issues.append((
+            "WARNING",
+            f"Path MTU is constrained to {path_mtu} bytes (below standard 1500 Ethernet MTU). "
+            "Packets larger than {0} bytes will fragment or drop if Path MTU Discovery fails on intermediate hops.".format(path_mtu)
+        ))
+        recommendations.append(
+            f"Use the Quick Fixes tab to set interface MTU to {path_mtu}, or set net.inet.tcp.mssdflt to {path_mtu - 40} on the Advanced tab."
+        )
+        if mssdflt_val is not None and mssdflt_val > path_mtu - 40:
+            issues.append((
+                "WARNING",
+                f"Current net.inet.tcp.mssdflt={mssdflt_val} exceeds discovered optimal MSS ({path_mtu - 40})."
+            ))
+    elif interface_mtu is not None and interface_mtu < 1500:
+        issues.append((
+            "INFO",
+            f"Upstream path supports 1500 MTU, though interface is currently configured to MTU {interface_mtu}."
+        ))
+
+    report_status = _derive_status(issues)
+    if report_status == "OK":
+        summary = f"Path supports full {path_mtu}-byte standard MTU with zero fragmentation."
+    else:
+        summary = f"Constrained Path MTU detected ({path_mtu} bytes)."
+
+    return DiagnosticReport(
+        title="Path MTU Discovery",
+        status=report_status,
+        summary=summary,
+        findings=findings,
+        issues=issues,
+        recommendations=recommendations,
+        raw=raw,
+    )
+
+
+def extract_benchmark_metrics(
+    nq_ok=False,
+    nq_out="",
+    gw_ping_ok=False,
+    gw_ping_out="",
+    inet_ping_ok=False,
+    inet_ping_out="",
+    dns_ok=False,
+    dns_out="",
+    dns_elapsed_ms=None,
+):
+    """Extract numeric benchmark metrics from live tool outputs for before/after comparison."""
+    metrics = {}
+
+    if nq_ok and nq_out:
+        cleaned = clean_cli_output(nq_out)
+        dl_m = re.search(r"Downlink capacity:\s*([\d\.]+)\s*(\w+ps)", cleaned)
+        ul_m = re.search(r"Uplink capacity:\s*([\d\.]+)\s*(\w+ps)", cleaned)
+        if dl_m:
+            metrics["downlink_mbps"] = _to_mbps(float(dl_m.group(1)), dl_m.group(2))
+        if ul_m:
+            metrics["uplink_mbps"] = _to_mbps(float(ul_m.group(1)), ul_m.group(2))
+        resp_m = re.search(r"Responsiveness:\s*(\w+)\s*\(([\d\.]+)\s*milliseconds\s*\|\s*(\d+)\s*RPM\)", cleaned)
+        if not resp_m:
+            resp_m2 = re.search(r"Responsiveness:\s*(\w+)\s*\n\s*(\d+)\s*RPM\s*\(([\d\.]+)\s*milliseconds\)", cleaned)
+            if resp_m2:
+                metrics["resp_rpm"] = int(resp_m2.group(2))
+                metrics["resp_ms"] = float(resp_m2.group(3))
+        else:
+            metrics["resp_ms"] = float(resp_m.group(2))
+            metrics["resp_rpm"] = int(resp_m.group(3))
+        idle_m = re.search(r"Idle Latency:\s*([\d\.]+)\s*milliseconds", cleaned)
+        if not idle_m:
+            idle_m = re.search(r"Idle Latency:\s*\n\s*(?:\d+\s*RPM\s*\()?([\d\.]+)\s*milliseconds", cleaned)
+        if idle_m:
+            metrics["idle_ms"] = float(idle_m.group(1))
+
+    if gw_ping_out:
+        gw = _parse_single_ping(gw_ping_out)
+        if gw["loss"] is not None:
+            metrics["gw_loss"] = gw["loss"]
+        if gw["avg"] is not None:
+            metrics["gw_avg_ms"] = gw["avg"]
+        if gw["stddev"] is not None:
+            metrics["gw_jitter_ms"] = gw["stddev"]
+
+    if inet_ping_out:
+        inet = _parse_single_ping(inet_ping_out)
+        if inet["loss"] is not None:
+            metrics["inet_loss"] = inet["loss"]
+        if inet["avg"] is not None:
+            metrics["inet_avg_ms"] = inet["avg"]
+
+    if dns_ok and dns_out:
+        _, qtime, _, _ = _extract_dig_metrics(dns_out)
+        if qtime is not None:
+            metrics["dns_ms"] = float(qtime)
+        elif dns_elapsed_ms is not None:
+            metrics["dns_ms"] = round(float(dns_elapsed_ms), 1)
+
+    return metrics
+
+
+def compare_benchmarks(before, after, before_label="Baseline", after_label="After Changes"):
+    """Compare two benchmark metric dicts and return a DiagnosticReport summarizing deltas."""
+    specs = [
+        ("downlink_mbps", "Downlink Capacity", "Mbps", True, 5.0),
+        ("uplink_mbps", "Uplink Capacity", "Mbps", True, 5.0),
+        ("resp_rpm", "Responsiveness", "RPM", True, 20.0),
+        ("resp_ms", "Loaded Latency", "ms", False, 15.0),
+        ("idle_ms", "Idle Latency", "ms", False, 5.0),
+        ("gw_avg_ms", "Gateway Ping", "ms", False, 2.0),
+        ("gw_loss", "Gateway Loss", "%", False, 0.5),
+        ("inet_avg_ms", "Internet Ping", "ms", False, 5.0),
+        ("inet_loss", "Internet Loss", "%", False, 0.5),
+        ("dns_ms", "DNS Latency", "ms", False, 5.0),
+    ]
+
+    findings = []
+    issues = []
+    improvements = 0
+    regressions = 0
+    raw_lines = [f"{before_label}: {before}", f"{after_label}: {after}"]
+
+    for key, label, unit, higher_is_better, sig_threshold in specs:
+        if key not in before or key not in after:
+            continue
+        b_val = before[key]
+        a_val = after[key]
+        delta = a_val - b_val
+        sign = "+" if delta > 0 else ""
+        pct_str = ""
+        if b_val > 0 and abs(delta) >= sig_threshold:
+            pct = (delta / b_val) * 100.0
+            pct_str = f" ({'+' if pct > 0 else ''}{pct:.1f}%)"
+
+        improved = (delta >= sig_threshold) if higher_is_better else (delta <= -sig_threshold)
+        regressed = (delta <= -sig_threshold) if higher_is_better else (delta >= sig_threshold)
+        tag = "IMPROVED" if improved else ("REGRESSED" if regressed else "UNCHANGED")
+        if improved:
+            improvements += 1
+        elif regressed:
+            regressions += 1
+
+        findings.append((label, f"{b_val:.2f} -> {a_val:.2f} {unit} ({sign}{delta:.2f} {unit}{pct_str}) [{tag}]"))
+        if regressed:
+            issues.append(("WARNING", f"{label} worsened from {b_val:.2f} to {a_val:.2f} {unit} ({sign}{delta:.2f} {unit})."))
+
+    if not findings:
+        return DiagnosticReport(
+            title="Before / After Comparison",
+            status="INFO",
+            summary="No overlapping benchmark metrics available to compare.",
+            issues=[("INFO", "Ensure both baseline and comparison runs completed.")],
+            raw="\n".join(raw_lines),
+        )
+
+    if regressions > 0 and improvements == 0:
+        status = "WARNING"
+        summary = f"Performance regressed on {regressions} metric(s) — consider reverting changes."
+    elif improvements > 0 and regressions == 0:
+        status = "OK"
+        summary = f"Measured improvement across {improvements} metric(s) with no regressions."
+    elif improvements > 0 and regressions > 0:
+        status = "INFO"
+        summary = f"Mixed results: {improvements} metric(s) improved, {regressions} regressed."
+    else:
+        status = "OK"
+        summary = "Metrics remained essentially unchanged from baseline."
+
+    return DiagnosticReport(
+        title="Before / After Comparison",
+        status=status,
+        summary=summary,
+        findings=findings,
+        issues=issues,
+        raw="\n".join(raw_lines),
+    )
+
