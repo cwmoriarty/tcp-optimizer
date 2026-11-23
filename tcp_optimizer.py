@@ -24,7 +24,9 @@ import os
 import platform
 import queue
 import shlex
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -156,7 +158,7 @@ def run_privileged(shell_command):
     """
     escaped = shell_command.replace("\\", "\\\\").replace('"', '\\"')
     osa = f'do shell script "{escaped}" with administrator privileges'
-    return run(["osascript", "-e", osa], timeout=30)
+    return run(["osascript", "-e", osa], timeout=90)
 
 
 def apply_sysctl_values(values):
@@ -312,6 +314,7 @@ class TCPOptimizerApp:
         else:
             self.preset_status.config(text=f"Failed to apply '{name}'.\n{raw}", fg="#a30000")
         self.refresh_overview()
+        self.reload_advanced()
 
     # ------------------------------------------------------------------ #
     # Advanced (manual per-key editing)
@@ -611,16 +614,20 @@ class TCPOptimizerApp:
         return parse_ifconfig_output(ok, out, err, cmd=cmd, sysctls=sysctls), cmd
 
     def _collect_dns(self):
-        cmd = "dig +tries=1 +time=3 example.com"
-        t0 = time.monotonic()
-        ok, out, err = run(["dig", "+tries=1", "+time=3", "example.com"])
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        if not ok:
+        has_dig = shutil.which("dig") is not None
+        if has_dig:
+            cmd = "dig +tries=1 +time=3 example.com"
+            t0 = time.monotonic()
+            ok, out, err = run(["dig", "+tries=1", "+time=3", "example.com"], timeout=8)
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+        else:
             cmd = "nslookup example.com"
             t0 = time.monotonic()
-            ok, out, err = run(["nslookup", "example.com"])
+            ok, out, err = run(["nslookup", "example.com"], timeout=8)
             elapsed_ms = (time.monotonic() - t0) * 1000.0
-        comp_ok, comp_out, _ = run(["dig", "+tries=1", "+time=3", "@1.1.1.1", "example.com"], timeout=5)
+        comp_ok, comp_out = False, None
+        if has_dig:
+            comp_ok, comp_out, _ = run(["dig", "+tries=1", "+time=3", "@1.1.1.1", "example.com"], timeout=5)
         sc_ok, sc_out, _ = run(["scutil", "--dns"], timeout=5)
         report = parse_dns_output(
             ok,
@@ -638,7 +645,8 @@ class TCPOptimizerApp:
         route_ok, route_out, _ = run(["route", "-n", "get", "default"], timeout=5)
         gw_ip, gw_iface = extract_default_gateway(route_out) if route_ok else (None, None)
         if gw_ip:
-            gw_ok, gw_out, gw_err = run(["ping", "-c", "6", "-i", "0.2", gw_ip], timeout=10)
+            ping_bin = "ping6" if ":" in gw_ip else "ping"
+            gw_ok, gw_out, gw_err = run([ping_bin, "-c", "6", "-i", "0.2", gw_ip], timeout=10)
         else:
             gw_ok, gw_out, gw_err = False, "", "No default gateway"
         inet_target = "1.1.1.1"
@@ -647,7 +655,7 @@ class TCPOptimizerApp:
             gw_ip, gw_iface, gw_ok, gw_out, gw_err,
             inet_ok, inet_out, inet_err, inet_target=inet_target,
         )
-        cmd = f"ping -c 6 {gw_ip or '<none>'} ; ping -c 6 {inet_target}"
+        cmd = f"{'ping6' if gw_ip and ':' in gw_ip else 'ping'} -c 6 {gw_ip or '<none>'} ; ping -c 6 {inet_target}"
         return report, cmd
 
     def _collect_tcp_stats(self):
@@ -760,25 +768,29 @@ class TCPOptimizerApp:
 </dict>
 </plist>
 """
-        # Write the script + plist to /tmp unprivileged, then move them into
-        # place and set ownership/permissions as one privileged operation.
-        tmp_script = "/tmp/tcpoptimizer-apply.sh"
-        tmp_plist = "/tmp/tcpoptimizer.plist"
-        with open(tmp_script, "w") as fh:
-            fh.write(script_content)
-        with open(tmp_plist, "w") as fh:
-            fh.write(plist_content)
+        # Stage script + plist inside a private temporary directory, then move
+        # into place and set ownership/permissions as one privileged operation.
+        with tempfile.TemporaryDirectory(prefix="tcpoptimizer-") as tmpdir:
+            tmp_script = os.path.join(tmpdir, "tcpoptimizer-apply.sh")
+            tmp_plist = os.path.join(tmpdir, "tcpoptimizer.plist")
+            with open(tmp_script, "w") as fh:
+                fh.write(script_content)
+            with open(tmp_plist, "w") as fh:
+                fh.write(plist_content)
 
-        cmd = (
-            f"mkdir -p {shlex.quote(os.path.dirname(SCRIPT_INSTALL_PATH))} && "
-            f"cp {shlex.quote(tmp_script)} {SCRIPT_INSTALL_PATH} && "
-            f"chmod 755 {SCRIPT_INSTALL_PATH} && "
-            f"cp {shlex.quote(tmp_plist)} {LAUNCH_DAEMON_PATH} && "
-            f"chown root:wheel {LAUNCH_DAEMON_PATH} && "
-            f"chmod 644 {LAUNCH_DAEMON_PATH} && "
-            f"launchctl load -w {LAUNCH_DAEMON_PATH}"
-        )
-        ok, out, err = run_privileged(cmd)
+            cmd = (
+                f"launchctl unload -w {LAUNCH_DAEMON_PATH} 2>/dev/null; "
+                f"launchctl unload -w {LEGACY_LAUNCH_DAEMON_PATH} 2>/dev/null; "
+                f"rm -f {LEGACY_LAUNCH_DAEMON_PATH} && "
+                f"mkdir -p {shlex.quote(os.path.dirname(SCRIPT_INSTALL_PATH))} && "
+                f"cp {shlex.quote(tmp_script)} {SCRIPT_INSTALL_PATH} && "
+                f"chmod 755 {SCRIPT_INSTALL_PATH} && "
+                f"cp {shlex.quote(tmp_plist)} {LAUNCH_DAEMON_PATH} && "
+                f"chown root:wheel {LAUNCH_DAEMON_PATH} && "
+                f"chmod 644 {LAUNCH_DAEMON_PATH} && "
+                f"launchctl load -w {LAUNCH_DAEMON_PATH}"
+            )
+            ok, out, err = run_privileged(cmd)
         if ok:
             self.persist_status.config(
                 text=f"Installed. '{name}' will be re-applied at every boot.\n{out}", fg="#0a7a0a"

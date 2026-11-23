@@ -593,6 +593,121 @@ tcp:
         self.assertNotIn("RAW CLI OUTPUT", no_raw)
         self.assertNotIn(raw_cmd_output, no_raw)
 
+    # ------------------------------------------------------------------ #
+    # Audit Regression Tests
+    # ------------------------------------------------------------------ #
+    def test_wifi_6ghz_low_channel_not_flagged_as_2ghz(self):
+        sample = """
+      Interfaces:
+        en0:
+          Status: Connected
+          Current Network Information:
+            Home_6E:
+              PHY Mode: 802.11ax
+              Channel: 5 (6GHz, 160MHz)
+              Security: WPA3 Personal
+              Signal / Noise: -52 dBm / -94 dBm
+              Transmit Rate: 2400
+        """
+        rep = parse_wifi_output(True, sample, "", "system_profiler SPAirPortDataType")
+        self.assertEqual(rep.status, "OK")
+        self.assertEqual(len(rep.issues), 0)
+        self.assertIn("6 GHz", dict(rep.findings).get("Channel & Band", ""))
+
+    def test_wifi_airport_negative_offset_and_connected_empty_block(self):
+        sample_airport = """
+agrCtlRSSI: -58
+agrCtlNoise: -92
+state: running
+lastTxRate: 866
+SSID: Studio_5G
+channel: 44,-1
+        """
+        rep = parse_wifi_output(True, sample_airport, "", "airport -I")
+        self.assertEqual(rep.status, "OK")
+        self.assertNotIn("-1MHz", dict(rep.findings).get("Channel & Band", ""))
+
+        sample_empty_connected = """
+      Interfaces:
+        en0:
+          Status: Connected
+        """
+        rep_empty = parse_wifi_output(True, sample_empty_connected, "", "system_profiler SPAirPortDataType")
+        self.assertEqual(rep_empty.status, "INFO")
+
+    def test_networkquality_high_idle_latency_sets_warning_status(self):
+        sample = """
+==== SUMMARY ====
+Uplink capacity: 100.000 Mbps
+Downlink capacity: 250.000 Mbps
+Responsiveness: High (45.000 milliseconds | 1333 RPM)
+Idle Latency: 110.500 milliseconds | 543 RPM
+        """
+        rep = parse_networkquality_output(True, sample, "", "networkQuality -v")
+        self.assertEqual(rep.status, "WARNING")
+        self.assertTrue(any("High Base Latency" in desc for _, desc in rep.issues))
+
+    def test_ifconfig_separates_apple_p2p_and_detects_ipv6_only_vpn(self):
+        sample = """
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 192.168.1.50 netmask 0xffffff00 broadcast 192.168.1.255
+	inet6 2600:1234::5 prefixlen 64 autoconf secured
+	status: active
+awdl0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet6 fe80::1%awdl0 prefixlen 64 scopeid 0x10
+	status: active
+utun5: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fd00:1234::2 prefixlen 64
+        """
+        rep = parse_ifconfig_output(True, sample, "", "ifconfig")
+        self.assertEqual(rep.status, "OK")
+        self.assertIn("1 active primary interface", rep.summary)
+        findings_dict = dict(rep.findings)
+        self.assertIn("2600:1234::5", findings_dict.get("Interface en0", ""))
+        self.assertIn("awdl0", findings_dict.get("Apple P2P/Internal", ""))
+        self.assertIn("utun5", findings_dict.get("Active VPN Tunnels", ""))
+
+    def test_dns_failed_primary_still_reports_1111_comparison_and_nslookup_ips(self):
+        comp_sample = """
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1
+;; Query time: 12 msec
+;; SERVER: 1.1.1.1#53(1.1.1.1)
+        """
+        rep_fail = parse_dns_output(
+            False, "", "connection timed out", "dig example.com",
+            comparison_ok=True, comparison_out=comp_sample,
+        )
+        self.assertEqual(rep_fail.status, "ERROR")
+        issue_texts = " ".join(d for _, d in rep_fail.issues)
+        self.assertIn("direct query to 1.1.1.1 succeeded", issue_texts)
+
+        nslookup_sample = """
+Server:		1.1.1.1
+Address:	1.1.1.1#53
+
+Non-authoritative answer:
+Name:	example.com
+Address: 1.1.1.10
+Address: 2606:2800:220:1:248:1893:25c8:1946
+        """
+        rep_ns = parse_dns_output(True, nslookup_sample, "", "nslookup example.com", elapsed_ms=10.0)
+        resolved = dict(rep_ns.findings).get("Resolved Addresses", "")
+        self.assertIn("1.1.1.10", resolved)
+        self.assertIn("2606:2800:220:1:248:1893:25c8:1946", resolved)
+
+    def test_tcp_stats_ignores_listen_socket_backlog_for_backpressure(self):
+        netstat_in = """
+Name       Mtu   Network       Address            Ipkts Ierrs    Opkts Oerrs  Coll
+en0        1500  <Link#14>   0e:5f:3a:5c:4f:7f  100000     0   100000     0     0
+        """
+        netstat_anv = """
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat
+tcp4       0 131072  127.0.0.1.8080         *.*                    LISTEN                 0            0  262144  262144
+        """
+        rep = parse_tcp_stats_output(True, netstat_in, "", True, "", "", True, netstat_anv, "")
+        self.assertEqual(rep.status, "OK")
+        self.assertEqual(len(rep.issues), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,16 @@ import ipaddress
 import re
 
 
+def _derive_status(issues, default="OK"):
+    """Derive overall report status from the highest-severity issue present."""
+    severities = {sev for sev, _ in issues}
+    if "ERROR" in severities:
+        return "ERROR"
+    if "WARNING" in severities:
+        return "WARNING"
+    return default
+
+
 def clean_cli_output(text):
     """
     Resolve terminal carriage-return ('\\r') line overwrites (such as
@@ -183,10 +193,11 @@ def parse_wifi_output(ok, out, err, cmd="", sysctls=None):
                 security = line.split(":", 1)[1].strip()
             elif line.startswith("channel:"):
                 channel_str = line.split(":", 1)[1].strip()
-                m_ch = re.match(r"(\d+)(?:,(\d+))?", channel_str)
+                m_ch = re.match(r"(\d+)(?:,([+-]?\d+))?", channel_str)
                 if m_ch:
                     channel_num = int(m_ch.group(1))
-                    width = f"{m_ch.group(2)}MHz" if m_ch.group(2) else None
+                    if m_ch.group(2) in ("20", "40", "80", "160", "320"):
+                        width = f"{m_ch.group(2)}MHz"
             elif line.startswith("state:"):
                 status = "Connected" if line.split(":", 1)[1].strip() == "running" else "Disconnected"
     else:
@@ -262,6 +273,16 @@ def parse_wifi_output(ok, out, err, cmd="", sysctls=None):
             raw=raw,
         )
 
+    if status == "Connected" and not any([channel_num, phy_mode, rssi is not None, tx_rate is not None]):
+        return DiagnosticReport(
+            title="Wi-Fi Link Info",
+            status="INFO",
+            summary="Wi-Fi appears connected, but detailed link metrics were not reported.",
+            findings=[("Wi-Fi Status", status), ("Network Name (SSID)", ssid or "Unknown")],
+            issues=[("INFO", "Unable to extract channel, PHY mode, or signal metrics from tool output.")],
+            raw=raw,
+        )
+
     # Findings
     if ssid == "<redacted>":
         findings.append(("Network Name (SSID)", "<redacted> (macOS hides SSID without Location Services access)"))
@@ -298,8 +319,8 @@ def parse_wifi_output(ok, out, err, cmd="", sysctls=None):
     # Bottleneck & Misconfiguration Analysis
     report_status = "OK"
 
-    # 1. 2.4 GHz bottleneck
-    if band == "2.4 GHz" or (channel_num and channel_num <= 14):
+    # 1. 2.4 GHz bottleneck (do not confuse 6 GHz channels 1-14 with 2.4 GHz)
+    if band == "2.4 GHz" or (band is None and channel_num and channel_num <= 14):
         report_status = "WARNING"
         issues.append((
             "WARNING",
@@ -369,6 +390,7 @@ def parse_wifi_output(ok, out, err, cmd="", sysctls=None):
         ))
         recommendations.append("Configure WPA2 or WPA3 encryption on your router.")
 
+    report_status = _derive_status(issues)
     if report_status == "OK":
         summary = "Wi-Fi link is healthy with modern standard and good signal."
     else:
@@ -400,7 +422,7 @@ def _to_mbps(val, unit):
 def parse_networkquality_output(ok, out, err, cmd="", sysctls=None):
     """Parse networkQuality CLI output."""
     cleaned_out = clean_cli_output(out)
-    raw = cleaned_out if cleaned_out.strip() else (err or out)
+    raw = cleaned_out if cleaned_out.strip() else clean_cli_output(err or out)
 
     has_partial_metrics = bool(
         cleaned_out and ("Downlink capacity:" in cleaned_out or "Uplink capacity:" in cleaned_out or "capacity " in cleaned_out)
@@ -590,10 +612,11 @@ def parse_networkquality_output(ok, out, err, cmd="", sysctls=None):
         ))
         recommendations.append("Apply 'Balanced Gigabit' or reset to macOS Default on the Presets tab.")
 
+    report_status = _derive_status(issues)
     if report_status == "OK":
         summary = "Network capacity and latency responsiveness are optimal."
     else:
-        summary = "Network issues detected (bufferbloat, timeout, or limited throughput)."
+        summary = "Network issues detected (bufferbloat, high latency, timeout, or limited throughput)."
 
     return DiagnosticReport(
         title="Network Quality Test",
@@ -661,14 +684,20 @@ def parse_ifconfig_output(ok, out, err, cmd="", sysctls=None):
 
     active_physical = []
     active_tunnels = []
+    active_internal = []
+
+    internal_prefixes = ("awdl", "llw", "ap", "p2p", "bridge")
 
     for name, data in blocks.items():
         if name == "lo0":
             continue
-        is_active = (data["status"] == "active") or bool(data["ipv4"])
+        has_routable_ip6 = any(not ip6.startswith("fe80:") for ip6 in data["ipv6"])
+        is_active = (data["status"] == "active") or bool(data["ipv4"]) or has_routable_ip6
         if is_active:
             if name.startswith("utun"):
                 active_tunnels.append(data)
+            elif name.startswith(internal_prefixes) and not data["ipv4"] and not has_routable_ip6:
+                active_internal.append(data)
             else:
                 active_physical.append(data)
 
@@ -693,11 +722,14 @@ def parse_ifconfig_output(ok, out, err, cmd="", sysctls=None):
         name = iface["name"]
         mtu = iface["mtu"]
         ipv4_strs = [f"{ip}" for ip, _ in iface["ipv4"]]
+        routable_ipv6 = [ip6 for ip6 in iface["ipv6"] if not ip6.startswith("fe80:")]
         media_val = iface["media"] or "N/A"
 
         desc = f"MTU {mtu}"
         if ipv4_strs:
             desc += f", IPv4: {', '.join(ipv4_strs)}"
+        if routable_ipv6:
+            desc += f", IPv6: {', '.join(routable_ipv6[:2])}"
         if iface["media"]:
             desc += f", Media: {iface['media']}"
         findings.append((f"Interface {name}", desc))
@@ -765,8 +797,12 @@ def parse_ifconfig_output(ok, out, err, cmd="", sysctls=None):
             "VPN tunnel encapsulation and encryption overhead can reduce peak throughput."
         ))
 
+    if active_internal:
+        findings.append(("Apple P2P/Internal", ", ".join(f"{i['name']} (MTU {i['mtu']})" for i in active_internal)))
+
+    report_status = _derive_status(issues)
     if report_status == "OK":
-        summary = f"All {len(active_physical)} active physical interface(s) configured normally."
+        summary = f"All {len(active_physical)} active primary interface(s) configured normally."
     else:
         summary = "Interface misconfiguration or physical speed limitation detected."
 
@@ -856,23 +892,40 @@ def parse_dns_output(
         raw_sections.append("\n--- System DNS Configuration (scutil --dns) ---\n" + scutil_out.strip())
     raw = "\n".join(s for s in raw_sections if s)
 
-    if not ok:
-        return DiagnosticReport(
-            title="DNS Lookup",
-            status="ERROR",
-            summary="DNS resolution failed completely.",
-            issues=[("ERROR", f"Lookup failed: {err or out}")],
-            recommendations=[
-                "Check DNS resolver settings in macOS System Settings > Network.",
-                "Configure reliable public DNS servers like Cloudflare (1.1.1.1) or Google (8.8.8.8).",
-            ],
-            raw=raw,
-        )
-
     findings = []
     issues = []
     recommendations = []
-    report_status = "OK"
+
+    if not ok:
+        issues.append(("ERROR", f"System DNS lookup failed: {err or out or 'no response'}"))
+        recommendations.extend([
+            "Check DNS resolver settings in macOS System Settings > Network.",
+            "Configure reliable public DNS servers like Cloudflare (1.1.1.1) or Google (8.8.8.8).",
+        ])
+        if comparison_ok and comparison_out:
+            comp_status, comp_time, _, _ = _extract_dig_metrics(comparison_out)
+            if comp_status == "NOERROR":
+                findings.append(("Cloudflare 1.1.1.1", f"{comp_time} ms (succeeded directly)"))
+                issues.append((
+                    "ERROR",
+                    "Internet connectivity works (direct query to 1.1.1.1 succeeded), "
+                    "so your configured DNS server is unreachable or broken."
+                ))
+        if scutil_out:
+            nameservers, search_domains = _parse_scutil_dns(scutil_out)
+            if nameservers:
+                findings.append(("Configured Resolvers", ", ".join(nameservers[:4])))
+            if search_domains:
+                findings.append(("Search Domains", ", ".join(search_domains[:4])))
+        return DiagnosticReport(
+            title="DNS Lookup",
+            status="ERROR",
+            summary="System DNS resolution failed.",
+            findings=findings,
+            issues=issues,
+            recommendations=recommendations,
+            raw=raw,
+        )
 
     is_dig = ";; ->>HEADER<<-" in out or ";; Query time:" in out
 
@@ -890,10 +943,10 @@ def parse_dns_output(
             dns_server = m_srv.group(1).strip()
             if m_addr:
                 dns_server += f" ({m_addr.group(1).strip()})"
-        for m in re.finditer(r"Address:\s*([0-9\.]+)", out):
-            ip_found = m.group(1).strip()
-            if dns_server and ip_found not in dns_server:
-                resolved_ips.append(ip_found)
+        # Only collect Address lines from the answer section (after `Name:`)
+        after_name = out.split("Name:", 1)[1] if "Name:" in out else ""
+        for m in re.finditer(r"Address:\s*([0-9a-fA-F:\.]+)", after_name):
+            resolved_ips.append(m.group(1).strip())
         if "** server can't find" in out or "connection timed out" in out.lower():
             dns_status = "SERVFAIL"
         else:
@@ -905,7 +958,6 @@ def parse_dns_output(
         query_time_ms = int(round(elapsed_ms))
 
     if dns_status and dns_status != "NOERROR":
-        report_status = "ERROR"
         issues.append((
             "ERROR",
             f"DNS query returned error status: {dns_status}. Hostnames cannot be resolved."
@@ -924,7 +976,6 @@ def parse_dns_output(
         findings.append(("Query Latency", f"{query_time_ms} ms ({speed_rating})"))
 
         if query_time_ms > 150:
-            report_status = "WARNING"
             issues.append((
                 "WARNING",
                 f"Slow DNS Resolution ({query_time_ms} ms). High DNS lookup latency adds delay to every new connection "
@@ -942,17 +993,19 @@ def parse_dns_output(
     if dns_server:
         findings.append(("DNS Resolver", dns_server))
         is_private = False
-        m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", dns_server)
+        server_ip_str = None
+        m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+|[0-9a-fA-F:]+:[0-9a-fA-F:]*)", dns_server.split("#", 1)[0])
         if m_ip:
+            server_ip_str = m_ip.group(1)
             try:
-                ip_obj = ipaddress.ip_address(m_ip.group(1))
+                ip_obj = ipaddress.ip_address(server_ip_str)
                 is_private = ip_obj.is_private
             except ValueError:
                 pass
         if is_private and query_time_ms and query_time_ms > 40:
             issues.append((
                 "INFO",
-                f"DNS queries are relayed through local router ({m_ip.group(1)}). Some consumer routers have weak DNS proxy performance."
+                f"DNS queries are relayed through local router ({server_ip_str}). Some consumer routers have weak DNS proxy performance."
             ))
 
     if dns_status:
@@ -966,8 +1019,6 @@ def parse_dns_output(
         if comp_status == "NOERROR" and comp_time is not None:
             findings.append(("Cloudflare 1.1.1.1", f"{comp_time} ms (direct comparison)"))
             if query_time_ms is not None and query_time_ms > 80 and comp_time < 40:
-                if report_status != "ERROR":
-                    report_status = "WARNING"
                 issues.append((
                     "WARNING",
                     f"Configured DNS resolver ({query_time_ms} ms) is significantly slower than direct 1.1.1.1 ({comp_time} ms). "
@@ -983,6 +1034,7 @@ def parse_dns_output(
         if search_domains:
             findings.append(("Search Domains", ", ".join(search_domains[:4])))
 
+    report_status = _derive_status(issues)
     if report_status == "OK":
         summary = f"DNS resolution is fast and functional ({query_time_ms if query_time_ms is not None else '<25'} ms)."
     elif report_status == "WARNING":
@@ -1077,6 +1129,7 @@ def parse_ping_output(
     recommendations = []
     report_status = "OK"
 
+    gw_stats = None
     if gw_ip:
         findings.append(("Default Gateway", f"{gw_ip}{f' ({gw_iface})' if gw_iface else ''}"))
         gw_stats = _parse_single_ping(gw_out)
@@ -1089,7 +1142,6 @@ def parse_ping_output(
             findings.append(("Gateway Ping", f"{gw_stats['loss']:.1f}% loss{rtt_part}"))
 
             if gw_stats["loss"] > 0:
-                report_status = "ERROR" if gw_stats["loss"] >= 25.0 else "WARNING"
                 issues.append((
                     "ERROR" if gw_stats["loss"] >= 25.0 else "WARNING",
                     f"Local Packet Loss to Gateway ({gw_stats['loss']:.1f}% loss to {gw_ip}). "
@@ -1100,7 +1152,6 @@ def parse_ping_output(
                     "Check Wi-Fi signal/band (switch from 2.4 GHz to 5 GHz), or inspect Ethernet cables and switch ports."
                 )
             elif gw_stats["stddev"] is not None and gw_stats["stddev"] > 10.0:
-                report_status = "WARNING"
                 issues.append((
                     "WARNING",
                     f"High Local Network Jitter (stddev {gw_stats['stddev']:.1f} ms, max {gw_stats['max']:.1f} ms to {gw_ip}). "
@@ -1108,10 +1159,8 @@ def parse_ping_output(
                 ))
                 recommendations.append("Use 5 GHz Wi-Fi on a clean channel or test over wired Ethernet.")
         elif not gw_ok:
-            report_status = "WARNING"
             issues.append(("WARNING", f"Gateway {gw_ip} did not respond to ping ({gw_err or 'timeout'})."))
     else:
-        report_status = "ERROR"
         issues.append(("ERROR", "No default IPv4 gateway found in routing table."))
         recommendations.append("Verify Wi-Fi or Ethernet connection and DHCP lease in Network Settings.")
 
@@ -1125,10 +1174,8 @@ def parse_ping_output(
         findings.append((f"Internet Ping ({inet_target})", f"{inet_stats['loss']:.1f}% loss{rtt_part}"))
 
         if inet_stats["loss"] > 0:
-            gw_clean = gw_ip and _parse_single_ping(gw_out).get("loss") == 0.0
+            gw_clean = gw_stats is not None and gw_stats.get("loss") == 0.0
             if gw_clean:
-                if report_status != "ERROR":
-                    report_status = "WARNING"
                 issues.append((
                     "WARNING",
                     f"Upstream Packet Loss ({inet_stats['loss']:.1f}% loss to {inet_target} while local gateway had 0% loss). "
@@ -1136,23 +1183,20 @@ def parse_ping_output(
                 ))
                 recommendations.append("Check modem signal levels / coax or fiber connections, or contact your ISP.")
             else:
-                report_status = "ERROR" if inet_stats["loss"] >= 25.0 else "WARNING"
                 issues.append((
                     "ERROR" if inet_stats["loss"] >= 25.0 else "WARNING",
                     f"Internet packet loss detected ({inet_stats['loss']:.1f}% to {inet_target})."
                 ))
         elif inet_stats["avg"] is not None and inet_stats["avg"] > 80.0:
-            if report_status == "OK":
-                report_status = "WARNING"
             issues.append((
                 "WARNING",
                 f"High Internet Ping ({inet_stats['avg']:.1f} ms avg to {inet_target})."
             ))
     elif not inet_ok:
-        report_status = "ERROR"
         issues.append(("ERROR", f"Unable to ping internet target {inet_target}: {inet_err or 'no response'}"))
         recommendations.append("Verify internet connectivity and firewall ICMP rules.")
 
+    report_status = _derive_status(issues)
     if report_status == "OK":
         summary = "Zero packet loss and low latency to both local gateway and internet."
     elif report_status == "WARNING":
@@ -1290,7 +1334,7 @@ def parse_tcp_stats_output(
                 continue
             state = parts[5]
             state_counts[state] = state_counts.get(state, 0) + 1
-            if recv_q > 65536 or send_q > 65536:
+            if state != "LISTEN" and (recv_q > 65536 or send_q > 65536):
                 queued_sockets += 1
             try:
                 rhiwat = int(parts[8])
@@ -1337,6 +1381,7 @@ def parse_tcp_stats_output(
             raw=raw,
         )
 
+    report_status = _derive_status(issues)
     if report_status == "OK":
         summary = "No interface errors, socket stalls, or TCP stack misconfigurations observed."
     else:
